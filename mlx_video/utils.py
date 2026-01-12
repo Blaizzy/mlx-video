@@ -9,12 +9,26 @@ from functools import partial
 from pathlib import Path
 from huggingface_hub import snapshot_download
 
-def get_model_path(model_repo: str):
-    """Get or download LTX-2 model path."""
+def get_model_path(model_repo: str) -> Path:
+    """Get or download model path. Supports HuggingFace repos and local paths.
+    
+    Args:
+        model_repo: Either a HuggingFace repo ID (e.g., 'Lightricks/LTX-2') 
+                   or a local filesystem path.
+    
+    Returns:
+        Path to the model directory.
+    """
+    # Check if it's a local path first
+    path = Path(model_repo)
+    if path.exists() and path.is_dir():
+        return path
+    
+    # Otherwise treat as HuggingFace repo
     try:
         return Path(snapshot_download(repo_id=model_repo, local_files_only=True))
     except Exception:
-        print("Downloading LTX-2 model weights...")
+        print(f"Downloading model from {model_repo}...")
         return Path(snapshot_download(
             repo_id=model_repo,
             local_files_only=False,

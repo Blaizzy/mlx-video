@@ -149,6 +149,7 @@ def denoise(
 def generate_video(
     model_repo: str,
     prompt: str,
+    text_encoder_repo: str = None,
     height: int = 512,
     width: int = 512,
     num_frames: int = 33,
@@ -160,7 +161,11 @@ def generate_video(
     """Generate video from text prompt.
 
     Args:
+        model_repo: HuggingFace repo ID or local path for the main model
         prompt: Text description of the video to generate
+        text_encoder_repo: Optional custom text encoder repo or local path.
+                          If None, uses model_repo. Supports both HuggingFace
+                          repos (e.g., 'user/custom-encoder') and local paths.
         height: Output video height (must be divisible by 64)
         width: Output video width (must be divisible by 64)
         num_frames: Number of frames (must be 1 + 8*k, e.g., 33, 65, 97)
@@ -188,11 +193,14 @@ def generate_video(
 
     mx.random.seed(seed)
 
-    # Load text encoder
+    # Load text encoder (from custom repo if specified, otherwise from model_repo)
     print(f"{Colors.BLUE}📝 Loading text encoder...{Colors.RESET}")
+    text_encoder_path = get_model_path(text_encoder_repo) if text_encoder_repo else model_path
+    if text_encoder_repo:
+        print(f"{Colors.DIM}Using custom text encoder: {text_encoder_repo}{Colors.RESET}")
     from mlx_video.models.ltx.text_encoder import LTX2TextEncoder
-    text_encoder = LTX2TextEncoder(model_path=str(model_path))
-    text_encoder.load(str(model_path))
+    text_encoder = LTX2TextEncoder(model_path=str(text_encoder_path))
+    text_encoder.load(str(text_encoder_path))
     mx.eval(text_encoder.parameters())
 
     text_embeddings, _ = text_encoder(prompt)
@@ -377,11 +385,18 @@ Examples:
         default="Lightricks/LTX-2",
         help="Model repository to use (default: Lightricks/LTX-2)"
     )
+    parser.add_argument(
+        "--text-encoder-repo",
+        type=str,
+        default=None,
+        help="Custom text encoder repository or local path (defaults to --model-repo)"
+    )
     args = parser.parse_args()
 
     generate_video(
         model_repo=args.model_repo,
         prompt=args.prompt,
+        text_encoder_repo=args.text_encoder_repo,
         height=args.height,
         width=args.width,
         num_frames=args.num_frames,
