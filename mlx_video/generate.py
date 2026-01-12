@@ -200,7 +200,8 @@ def generate_video(
         print(f"{Colors.DIM}Using custom text encoder: {text_encoder_repo}{Colors.RESET}")
     from mlx_video.models.ltx.text_encoder import LTX2TextEncoder
     text_encoder = LTX2TextEncoder(model_path=str(text_encoder_path))
-    text_encoder.load(str(text_encoder_path))
+    # Load transformer weights from the main model repository
+    text_encoder.load(str(model_path))
     mx.eval(text_encoder.parameters())
 
     text_embeddings, _ = text_encoder(prompt)
