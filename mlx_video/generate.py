@@ -636,8 +636,8 @@ Examples:
     parser.add_argument(
         "--model-repo",
         type=str,
-        default="Lightricks/LTX-2",
-        help="Model repository to use (default: Lightricks/LTX-2)"
+        default="mlx-community/LTX-2-distilled-bf16",
+        help="Model repository to use (default: mlx-community/LTX-2-distilled-bf16)"
     )
     parser.add_argument(
         "--text-encoder-repo",

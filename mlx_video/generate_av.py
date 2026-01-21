@@ -769,8 +769,8 @@ Examples:
                         help="Output video path (default: output_av.mp4)")
     parser.add_argument("--output-audio", type=str, default=None,
                         help="Output audio path (default: same as video with .wav)")
-    parser.add_argument("--model-repo", type=str, default="Lightricks/LTX-2",
-                        help="Model repository (default: Lightricks/LTX-2)")
+    parser.add_argument("--model-repo", type=str, default="mlx-community/LTX-2-distilled-bf16",
+                        help="Model repository (default: mlx-community/LTX-2-distilled-bf16)")
     parser.add_argument("--text-encoder-repo", type=str, default=None,
                         help="Text encoder repository")
     parser.add_argument("--verbose", action="store_true",

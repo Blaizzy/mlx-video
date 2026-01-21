@@ -10,7 +10,19 @@ from huggingface_hub import snapshot_download
 from PIL import Image
 
 def get_model_path(model_repo: str):
-    """Get or download LTX-2 model path."""
+    """Get or download model path.
+    
+    Args:
+        model_repo: Either a Hugging Face repo ID (e.g., 'namespace/repo_name')
+                   or a local path to the model directory.
+    
+    Returns:
+        Path to the model directory.
+    """
+    local_path = Path(model_repo)
+    if local_path.exists() and local_path.is_dir():
+        return local_path
+    
     try:
         return Path(snapshot_download(repo_id=model_repo, local_files_only=True))
     except Exception:

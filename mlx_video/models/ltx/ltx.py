@@ -121,13 +121,18 @@ class TransformerArgsPreprocessor:
         timestep, embedded_timestep = self._prepare_timestep(modality.timesteps, x.shape[0], hidden_dtype=x.dtype)
         context, attention_mask = self._prepare_context(modality.context, x, modality.context_mask)
         attention_mask = self._prepare_attention_mask(attention_mask, modality.latent.dtype)
-        pe = self._prepare_positional_embeddings(
-            positions=modality.positions,
-            inner_dim=self.inner_dim,
-            max_pos=self.max_pos,
-            use_middle_indices_grid=self.use_middle_indices_grid,
-            num_attention_heads=self.num_attention_heads,
-        )
+
+        # Use precomputed positional embeddings if provided (avoids expensive RoPE recomputation)
+        if modality.positional_embeddings is not None:
+            pe = modality.positional_embeddings
+        else:
+            pe = self._prepare_positional_embeddings(
+                positions=modality.positions,
+                inner_dim=self.inner_dim,
+                max_pos=self.max_pos,
+                use_middle_indices_grid=self.use_middle_indices_grid,
+                num_attention_heads=self.num_attention_heads,
+            )
 
         return TransformerArgs(
             x=x,
