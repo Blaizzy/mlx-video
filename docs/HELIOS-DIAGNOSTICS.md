@@ -203,6 +203,10 @@ start_point_list.append((sp - sp_mean) / sp_std)
 
 Result: R=206,G=107,B=43 → **R=152,G=111,B=75** (balanced warm tones for beach prompt).
 
+**REVERTED**: See Bug 9 below — this normalization was found to be the cause of the
+pure noise output. The reference implementation does NOT normalize start_point.
+Mild per-channel mean growth across stages is the expected behavior.
+
 ### Bug 8: Precision mismatch (MLX vs PyTorch)
 
 **Symptom**: Subtle color shifts compared to reference.
@@ -215,38 +219,74 @@ scheduler's `step_dmd` never cast back to the original dtype.
 
 Note: This alone had minimal impact on color — the normalized start_point was the primary fix.
 
+### Bug 9: Pure noise output — start-point normalization breaks DMD trajectory
+
+**Symptom**: Output was pure noise even for the first chunk. No recognizable content.
+
+**Root cause**: The start_point normalization added in Bug 7's fix (commit `c5acde72`)
+changed the scale of the noise tensor used in DMD re-noising. The DMD formula:
+```
+prev = (1 - sigma_next) * x0_pred + sigma_next * start_point
+```
+relies on `start_point` having the correct magnitude — it's the original noisy latent
+at each pyramid stage, scaled by the alpha/beta blending coefficients. Normalizing to
+unit std destroys this scale relationship, causing the denoising trajectory to diverge.
+
+The reference implementation (`pipeline_helios_diffusers.py` line 703) simply appends
+the blended latent without any normalization:
+```python
+start_point_list.append(latents)
+```
+
+**Investigation** (systematic comparison against reference):
+1. Line-by-line comparison of `generate_helios.py` vs `pipeline_helios_diffusers.py`
+2. Verified scheduler sigmas, timesteps, DMD expansion/trim all match reference
+3. Verified VAE denormalization is correct (WanVAE handles internally)
+4. Verified block noise Cholesky approach matches reference MultivariateNormal
+5. Identified start_point normalization as the only functional deviation from reference
+
+**Fix**: Removed the normalization, restoring `start_point_list.append(latents)` to
+match the reference.
+
+**Debug output** (seed=42, "A calm ocean at sunset", 384×640, 33 frames):
+```
+Stage 0 (1/4 res, 12×20): sigmas=[0.998, 0.354, 0.0], ts=[998.5, 834.0]
+  Step 0: model_out std=0.505 → latent std=0.719
+  Step 1: model_out std=0.515 → latent std=0.603
+Stage 1 (1/2 res, 24×40): alpha=0.60, beta=0.69
+  Step 0: model_out std=0.622 → latent std=0.552
+  Step 1: model_out std=0.581 → latent std=0.548
+Stage 2 (full res, 48×80): alpha=0.75, beta=0.43
+  Step 0: model_out std=0.668 → latent std=0.603
+  Step 1: model_out std=0.594 → latent std=0.762
+
+Output frame analysis:
+  R=114, G=59, B=17 (warm sunset tones ✓)
+  Gradient: dx=0.2, dy=0.4 (smooth, structured)
+  Entropy: 5.54 bits (normal range)
+  Frame-to-frame diff: 3.46 avg (temporally coherent ✓)
+```
+
+**Status**: Mean cascade still exists (mean grows -0.07 → -0.15 → -0.23 across stages)
+but is mild. This appears to be inherent model behavior, not a bug. The per-channel
+growth is within the VAE's normalization range and decodes to warm, plausible colors.
+
 ---
 
 ## Open Problems
 
-### 1. Chunk 2 instability (dog prompt)
+### 1. Multi-chunk temporal stability
 
-**Status**: Partially resolved. Bird/sky prompt generates coherent 2-chunk output. Dog/beach
-prompt shows instability in chunk 2 (dark frame at midpoint, inconsistent colors).
+**Status**: Not re-tested after Bug 9 fix. Previously showed instability in chunk 2
+(dark frame at midpoint, inconsistent colors). Now that start-point normalization is
+removed, the multi-chunk behavior may have changed.
 
-**Evidence** (2-chunk dog generation with normalized start_point):
-```
-Frame 0:  R=151, G=109, B=73  (warm beach ✓)
-Frame 33: R=200, G=127, B=66  (warmer but OK)
-Frame 50: R=44,  G=44,  B=33  (very dark ✗)
-Frame 65: R=167, G=94,  B=44  (warm again)
-Motion 33→50: 94.4 (very high — suggests major artifacts)
-```
+**Next step**: Test with 99 frames (3 chunks) and evaluate chunk transitions.
 
-**Possible causes**:
-- The normalized start_point removes structural information that helps guide chunk 2
-- History latents from chunk 1 carry mean bias, confusing the model
-- Seed-dependent — might not reproduce with different seeds
+### 2. Color warmth / saturation
 
-**Possible fixes to explore**:
-- Try `amplify_first_chunk=True` (reference recommends for distilled)
-- Try different normalization (preserve some fraction of the mean instead of zeroing)
-- Try more pyramid steps for chunk 2 only (e.g., 4+4+4)
-
-### 2. Colors still warmer than expected
-
-**Status**: Improved but not fully resolved. Beach prompt gives R=152,G=111,B=75 — plausible
-but still warm-biased. We cannot verify against reference output because it requires CUDA.
+**Status**: Output shows warm tones that are plausible for "sunset" prompts but may be
+warm-biased for neutral prompts. Cannot verify without reference CUDA output.
 
 **Unknown**: Whether the reference PyTorch code also produces warm-biased output for the same
 prompt and seed. The growing channel means may be inherent to the model's behavior with the

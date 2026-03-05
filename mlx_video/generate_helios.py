@@ -84,13 +84,19 @@ def _spatial_unreshape(
 
 
 def _bilinear_downsample_2d(x: mx.array, target_h: int, target_w: int) -> mx.array:
-    """Bilinear interpolation downsample. Input: (F, C, H, W)."""
+    """Bilinear interpolation downsample matching F.interpolate(mode='bilinear').
+
+    For 2× integer downsampling, PyTorch's bilinear interpolation with
+    align_corners=False samples at the centers of the output cells using a
+    triangular (tent) filter over the 2×2 input neighborhood.  With a scale
+    factor of exactly 0.5 this reduces to a weighted average:
+        [1/4, 1/4, 1/4, 1/4] — i.e. the same as area averaging.
+
+    Input: (F, C, H, W).
+    """
     F, C, H, W = x.shape
-    # MLX doesn't have F.interpolate — use manual bilinear via grid sampling
-    # Simple approach: reshape to (F*C, 1, H, W) and use average pooling
     scale_h = H // target_h
     scale_w = W // target_w
-    # Use reshape-based area averaging (equivalent to bilinear for integer factors)
     x = x.reshape(F, C, target_h, scale_h, target_w, scale_w)
     x = x.mean(axis=(3, 5))
     return x
@@ -117,6 +123,16 @@ def _downsample_history(hist: mx.array, factor: int) -> mx.array:
     return hist
 
 
+def _debug_stats(name: str, x: mx.array) -> str:
+    """Return a compact stats string for a tensor."""
+    x_f = x.astype(mx.float32)
+    return (
+        f"{name}: shape={list(x.shape)} dtype={x.dtype} "
+        f"mean={x_f.mean().item():.6f} std={x_f.std().item():.6f} "
+        f"min={x_f.min().item():.6f} max={x_f.max().item():.6f}"
+    )
+
+
 def generate_video(
     model_dir: str,
     prompt: str,
@@ -130,6 +146,7 @@ def generate_video(
     amplify_first_chunk: bool = False,
     guidance_scale: float = 1.0,
     negative_prompt: str = "",
+    debug: bool = False,
 ):
     """Generate video using Helios autoregressive pipeline with pyramid denoising.
 
@@ -326,6 +343,11 @@ def generate_video(
         # Track per-stage start points for DMD re-noising
         start_point_list = [latents]
 
+        if debug:
+            mx.eval(latents)
+            print(f"\n[DEBUG] Chunk {chunk_idx}: initial noise → 1/4 res")
+            print(f"  {_debug_stats('start_point[0]', latents)}")
+
         pbar = tqdm(
             total=sum(pyramid_steps),
             desc=f"  Chunk {chunk_idx + 1}/{num_chunks}",
@@ -348,6 +370,13 @@ def generate_video(
             )
             timesteps = scheduler.timesteps
 
+            if debug:
+                mx.eval(latents)
+                print(f"\n[DEBUG] Stage {i_s}: res={cur_h}x{cur_w}, seq_len={image_seq_len}")
+                print(f"  sigmas: {[f'{s:.6f}' for s in scheduler.sigmas.tolist()]}")
+                print(f"  timesteps: {[f'{t:.1f}' for t in timesteps.tolist()]}")
+                print(f"  {_debug_stats('latents_in', latents)}")
+
             if i_s > 0:
                 # Upsample 2x with nearest-neighbor
                 cur_h *= 2
@@ -367,15 +396,12 @@ def generate_video(
                     config.patch_size, gamma,
                 )
                 latents = alpha * latents + beta * block_noise
-                # Normalize start_point per-channel to zero mean and unit std.
-                # The blended signal carries mean bias from the previous stage's
-                # x0 prediction; normalizing prevents this bias from cascading
-                # through DMD re-noising while preserving spatial structure.
-                sp = latents
-                keepdim_axes = tuple(range(1, sp.ndim))  # all axes except channel
-                sp_mean = mx.mean(sp, axis=keepdim_axes, keepdims=True)
-                sp_std = mx.clip(sp.std(axis=keepdim_axes, keepdims=True), a_min=1e-6, a_max=None)
-                start_point_list.append((sp - sp_mean) / sp_std)
+                start_point_list.append(latents)
+
+                if debug:
+                    mx.eval(latents)
+                    print(f"  After upsample+mix: alpha={alpha:.4f} beta={beta:.4f} ori_sigma={ori_sigma:.4f}")
+                    print(f"  {_debug_stats('start_point[' + str(i_s) + ']', latents)}")
 
             # History is always passed at full resolution — the Conv3d
             # patchifiers handle the spatial mismatch between history and
@@ -407,6 +433,12 @@ def generate_video(
                 )
                 mx.eval(noise_pred)
 
+                if debug:
+                    sigma_t = scheduler.sigmas[idx].item()
+                    print(f"\n  [Step {idx}] t={int(t.item())} sigma={sigma_t:.6f}")
+                    print(f"    {_debug_stats('model_in', latents)}")
+                    print(f"    {_debug_stats('noise_pred', noise_pred)}")
+
                 if do_cfg:
                     noise_uncond = model(
                         latents=latents.astype(mx.bfloat16),
@@ -431,7 +463,16 @@ def generate_video(
                     noisy_start=start_point_list[i_s],
                 )
                 mx.eval(latents)
+
+                if debug:
+                    print(f"    {_debug_stats('latents_out', latents)}")
+
                 pbar.update(1)
+
+            if debug:
+                mx.eval(latents)
+                print(f"\n[DEBUG] Stage {i_s} complete:")
+                print(f"  {_debug_stats('stage_output', latents)}")
 
         pbar.close()
         mx.eval(latents)
@@ -532,6 +573,7 @@ def main():
     )
     parser.add_argument("--guidance-scale", type=float, default=1.0, help="CFG guidance scale (1.0 = no CFG, default for distilled)")
     parser.add_argument("--negative-prompt", type=str, default="", help="Negative prompt for CFG")
+    parser.add_argument("--debug", action="store_true", help="Print per-step latent statistics for debugging")
     args = parser.parse_args()
 
     generate_video(
@@ -547,6 +589,7 @@ def main():
         amplify_first_chunk=args.amplify_first_chunk,
         guidance_scale=args.guidance_scale,
         negative_prompt=args.negative_prompt,
+        debug=args.debug,
     )
 
 
