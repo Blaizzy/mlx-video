@@ -367,13 +367,15 @@ def generate_video(
                     config.patch_size, gamma,
                 )
                 latents = alpha * latents + beta * block_noise
-                # Use fresh noise for DMD re-noising start point.
-                # The blended signal (alpha*denoised + beta*noise) causes
-                # variance inflation when used as the re-noising target in
-                # step_dmd, leading to color distortion.
-                start_point_list.append(
-                    mx.random.normal(latents.shape)
-                )
+                # Normalize start_point per-channel to zero mean and unit std.
+                # The blended signal carries mean bias from the previous stage's
+                # x0 prediction; normalizing prevents this bias from cascading
+                # through DMD re-noising while preserving spatial structure.
+                sp = latents
+                keepdim_axes = tuple(range(1, sp.ndim))  # all axes except channel
+                sp_mean = mx.mean(sp, axis=keepdim_axes, keepdims=True)
+                sp_std = mx.clip(sp.std(axis=keepdim_axes, keepdims=True), a_min=1e-6, a_max=None)
+                start_point_list.append((sp - sp_mean) / sp_std)
 
             # History is always passed at full resolution — the Conv3d
             # patchifiers handle the spatial mismatch between history and
@@ -389,14 +391,15 @@ def generate_video(
             for idx, t in enumerate(timesteps):
                 # Reference casts timestep to int64 before model call
                 timestep = mx.array(int(t.item()), dtype=mx.int32)
+                # Cast to bfloat16 to match reference (model trained with bf16 activations)
                 noise_pred = model(
-                    latents=latents,
+                    latents=latents.astype(mx.bfloat16),
                     timestep=timestep,
                     encoder_hidden_states=context_embedded,
                     frame_indices=cur_idx,
-                    history_short=h_short,
-                    history_mid=h_mid,
-                    history_long=h_long,
+                    history_short=h_short.astype(mx.bfloat16),
+                    history_mid=h_mid.astype(mx.bfloat16),
+                    history_long=h_long.astype(mx.bfloat16),
                     history_short_indices=cur_idx_short,
                     history_mid_indices=cur_idx_mid,
                     history_long_indices=cur_idx_long,
@@ -406,13 +409,13 @@ def generate_video(
 
                 if do_cfg:
                     noise_uncond = model(
-                        latents=latents,
+                        latents=latents.astype(mx.bfloat16),
                         timestep=timestep,
                         encoder_hidden_states=negative_context_embedded,
                         frame_indices=cur_idx,
-                        history_short=h_short,
-                        history_mid=h_mid,
-                        history_long=h_long,
+                        history_short=h_short.astype(mx.bfloat16),
+                        history_mid=h_mid.astype(mx.bfloat16),
+                        history_long=h_long.astype(mx.bfloat16),
                         history_short_indices=cur_idx_short,
                         history_mid_indices=cur_idx_mid,
                         history_long_indices=cur_idx_long,
@@ -427,6 +430,7 @@ def generate_video(
                     cur_step=idx,
                     noisy_start=start_point_list[i_s],
                 )
+                mx.eval(latents)
                 pbar.update(1)
 
         pbar.close()

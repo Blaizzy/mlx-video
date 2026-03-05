@@ -235,7 +235,7 @@ class HeliosScheduler:
             prev_sample = x0_pred
 
         self._step_index = cur_step + 1
-        return prev_sample
+        return prev_sample.astype(orig_dtype)
 
     def step(
         self,
