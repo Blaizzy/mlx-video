@@ -235,6 +235,12 @@ class HeliosModel(nn.Module):
         c, f, h, w = x.shape
         pt, ph, pw = self._patch_size
 
+        # Truncate to patch-aligned dims (matches Conv3d floor-division)
+        f = (f // pt) * pt
+        h = (h // ph) * ph
+        w = (w // pw) * pw
+        x = x[:, :f, :h, :w]
+
         f_out = f // pt
         h_out = h // ph
         w_out = w // pw

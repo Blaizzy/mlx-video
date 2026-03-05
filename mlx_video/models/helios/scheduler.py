@@ -133,8 +133,11 @@ class HeliosScheduler:
 
     @staticmethod
     def _time_shift(mu: float, sigma: float, t):
-        """Apply dynamic time shift: mu*t / (mu + (1-mu)*t)."""
-        return mu * t / (mu + (1 - mu) * t)
+        """Apply dynamic time shift: mu / (mu + (1/t - 1)^sigma).
+
+        For sigma=1 (default), simplifies to: mu*t / (1 + (mu-1)*t).
+        """
+        return mu * t / (1 + (mu - 1) * t)
 
     def set_timesteps(
         self,

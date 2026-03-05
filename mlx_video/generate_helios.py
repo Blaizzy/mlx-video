@@ -178,9 +178,12 @@ def generate_video(
     num_frames = num_chunks * frames_per_chunk
     total_latent_frames = num_chunks * num_latent_per_chunk
 
-    # Align spatial dimensions
-    align_h = config.patch_size[1] * vae_stride_h  # 2 * 8 = 16
-    align_w = config.patch_size[2] * vae_stride_w  # 2 * 8 = 16
+    # Align spatial dimensions for pyramid: need latent H,W divisible by
+    # 2^(stages-1) * patch = 4*2 = 8, so pixel dims by 8*vae_stride = 64
+    num_stages = len(pyramid_steps)
+    pyramid_factor = 2 ** (num_stages - 1)  # 4 for 3-stage
+    align_h = config.patch_size[1] * pyramid_factor * vae_stride_h  # 2*4*8 = 64
+    align_w = config.patch_size[2] * pyramid_factor * vae_stride_w  # 2*4*8 = 64
     height = ((height + align_h - 1) // align_h) * align_h
     width = ((width + align_w - 1) // align_w) * align_w
 

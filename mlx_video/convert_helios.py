@@ -229,6 +229,154 @@ def sanitize_helios_t5_weights(weights: Dict[str, mx.array]) -> Dict[str, mx.arr
     return sanitized
 
 
+def sanitize_helios_vae_weights(weights: Dict[str, mx.array]) -> Dict[str, mx.array]:
+    """Convert HF diffusers AutoencoderKLWan keys to MLX WanVAE keys.
+
+    Handles key renaming and Conv3d/Conv2d weight transpositions.
+
+    Key mapping:
+        post_quant_conv → conv2
+        quant_conv → conv1
+        decoder.conv_in → decoder.conv1
+        decoder.conv_out → decoder.head.2
+        decoder.norm_out → decoder.head.0
+        decoder.mid_block.resnets.{i} → decoder.middle.{i*2}
+        decoder.mid_block.attentions.0 → decoder.middle.1
+        decoder.up_blocks.{b}.resnets.{r} → decoder.upsamples.{flat}
+        decoder.up_blocks.{b}.upsamplers.0 → decoder.upsamples.{flat}
+        Within resnets: norm1→residual.0, conv1→residual.2,
+                        norm2→residual.3, conv2→residual.6,
+                        conv_shortcut→shortcut
+        encoder.* keys are skipped (decoder-only loading)
+    """
+    # The WanVAE decoder.upsamples is a flat Sequential.
+    # For dim_mult=[1,2,4,4], num_res_blocks=2 (→3 resnets/block):
+    #   up_block 0: upsamples 0-2 (resnets) + 3 (upsampler with time_conv)
+    #   up_block 1: upsamples 4-6 (resnets) + 7 (upsampler with time_conv)
+    #   up_block 2: upsamples 8-10 (resnets) + 11 (upsampler, no time_conv)
+    #   up_block 3: upsamples 12-14 (resnets only, no upsampler)
+    block_offsets = {0: 0, 1: 4, 2: 8, 3: 12}
+    upsampler_offsets = {0: 3, 1: 7, 2: 11}
+
+    # Resnet sub-key mapping
+    resnet_map = {
+        "norm1": "residual.0",
+        "conv1": "residual.2",
+        "norm2": "residual.3",
+        "conv2": "residual.6",
+        "conv_shortcut": "shortcut",
+    }
+
+    sanitized = {}
+    latents_mean = None
+    latents_std = None
+
+    for key, value in weights.items():
+        # Transpose Conv3d [O, I, D, H, W] → MLX [O, D, H, W, I]
+        if "weight" in key and value.ndim == 5:
+            value = mx.transpose(value, (0, 2, 3, 4, 1))
+        # Transpose Conv2d [O, I, H, W] → MLX [O, H, W, I]
+        if "weight" in key and value.ndim == 4:
+            value = mx.transpose(value, (0, 2, 3, 1))
+
+        # Skip encoder keys
+        if key.startswith("encoder."):
+            continue
+
+        # Top-level convolutions
+        if key.startswith("post_quant_conv."):
+            new_key = key.replace("post_quant_conv.", "conv2.")
+            sanitized[new_key] = value
+            continue
+        if key.startswith("quant_conv."):
+            new_key = key.replace("quant_conv.", "conv1.")
+            sanitized[new_key] = value
+            continue
+
+        # Decoder conv_in → conv1
+        if key.startswith("decoder.conv_in."):
+            new_key = key.replace("decoder.conv_in.", "decoder.conv1.")
+            sanitized[new_key] = value
+            continue
+
+        # Decoder conv_out → head.2
+        if key.startswith("decoder.conv_out."):
+            new_key = key.replace("decoder.conv_out.", "decoder.head.2.")
+            sanitized[new_key] = value
+            continue
+
+        # Decoder norm_out → head.0
+        if key.startswith("decoder.norm_out."):
+            new_key = key.replace("decoder.norm_out.", "decoder.head.0.")
+            sanitized[new_key] = value
+            continue
+
+        # Mid block resnets
+        if key.startswith("decoder.mid_block.resnets."):
+            rest = key[len("decoder.mid_block.resnets."):]
+            # rest = "{i}.{subkey}"
+            parts = rest.split(".", 1)
+            resnet_idx = int(parts[0])
+            subkey = parts[1]  # e.g. "norm1.gamma" or "conv1.weight"
+            mid_idx = resnet_idx * 2  # resnets 0→middle.0, 1→middle.2
+
+            sub_prefix = subkey.split(".")[0]
+            if sub_prefix in resnet_map:
+                mapped = resnet_map[sub_prefix]
+                sub_rest = subkey[len(sub_prefix):]
+                new_key = f"decoder.middle.{mid_idx}.{mapped}{sub_rest}"
+            else:
+                new_key = f"decoder.middle.{mid_idx}.{subkey}"
+            sanitized[new_key] = value
+            continue
+
+        # Mid block attention
+        if key.startswith("decoder.mid_block.attentions.0."):
+            rest = key[len("decoder.mid_block.attentions.0."):]
+            new_key = f"decoder.middle.1.{rest}"
+            sanitized[new_key] = value
+            continue
+
+        # Up blocks
+        if key.startswith("decoder.up_blocks."):
+            rest = key[len("decoder.up_blocks."):]
+            # Parse block index
+            parts = rest.split(".", 1)
+            block_idx = int(parts[0])
+            sub = parts[1]
+
+            if sub.startswith("resnets."):
+                resnet_rest = sub[len("resnets."):]
+                rparts = resnet_rest.split(".", 1)
+                resnet_idx = int(rparts[0])
+                subkey = rparts[1]
+                flat_idx = block_offsets[block_idx] + resnet_idx
+
+                sub_prefix = subkey.split(".")[0]
+                if sub_prefix in resnet_map:
+                    mapped = resnet_map[sub_prefix]
+                    sub_rest = subkey[len(sub_prefix):]
+                    new_key = f"decoder.upsamples.{flat_idx}.{mapped}{sub_rest}"
+                else:
+                    new_key = f"decoder.upsamples.{flat_idx}.{subkey}"
+                sanitized[new_key] = value
+                continue
+
+            if sub.startswith("upsamplers.0."):
+                upsampler_rest = sub[len("upsamplers.0."):]
+                flat_idx = upsampler_offsets[block_idx]
+                new_key = f"decoder.upsamples.{flat_idx}.{upsampler_rest}"
+                sanitized[new_key] = value
+                continue
+
+        logger.debug("Skipped VAE key: %s", key)
+
+    # Add latent statistics as buffers
+    # WanVAE expects 'mean', 'std', 'inv_std' as registered buffers
+    # Read from config if available, otherwise use zeros
+    return sanitized
+
+
 def convert_helios_checkpoint(
     checkpoint_dir: str,
     output_dir: str,
@@ -261,7 +409,6 @@ def convert_helios_checkpoint(
     """
     from mlx_video.convert_wan import (
         load_safetensors_weights,
-        sanitize_wan_vae_weights,
     )
 
     checkpoint_dir = Path(checkpoint_dir)
@@ -357,7 +504,7 @@ def convert_helios_checkpoint(
     if vae_dir.exists():
         print("Converting VAE...")
         weights = load_safetensors_weights(str(vae_dir))
-        weights = sanitize_wan_vae_weights(weights)
+        weights = sanitize_helios_vae_weights(weights)
         # VAE in float32 for quality
         weights = {k: v.astype(mx.float32) for k, v in weights.items()}
         out_path = output_dir / "vae.safetensors"

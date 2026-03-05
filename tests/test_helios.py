@@ -465,3 +465,90 @@ class TestHeliosT5Sanitization:
         }
         s = sanitize_helios_t5_weights(w)
         assert len(s) == 0
+
+
+class TestHeliosVAESanitization:
+    """Tests for Helios VAE (HF diffusers → WanVAE) weight key mapping."""
+
+    def test_top_level_convolutions(self):
+        from mlx_video.convert_helios import sanitize_helios_vae_weights
+
+        w = {
+            "post_quant_conv.weight": mx.ones((16, 16, 1, 1, 1)),
+            "post_quant_conv.bias": mx.ones((16,)),
+            "quant_conv.weight": mx.ones((32, 32, 1, 1, 1)),
+            "quant_conv.bias": mx.ones((32,)),
+        }
+        s = sanitize_helios_vae_weights(w)
+        assert "conv2.weight" in s
+        assert "conv2.bias" in s
+        assert "conv1.weight" in s
+        assert "conv1.bias" in s
+        # Conv3d should be transposed
+        assert s["conv2.weight"].shape == (16, 1, 1, 1, 16)
+
+    def test_decoder_conv_in_out(self):
+        from mlx_video.convert_helios import sanitize_helios_vae_weights
+
+        w = {
+            "decoder.conv_in.weight": mx.ones((384, 16, 3, 3, 3)),
+            "decoder.conv_in.bias": mx.ones((384,)),
+            "decoder.conv_out.weight": mx.ones((3, 96, 3, 3, 3)),
+            "decoder.conv_out.bias": mx.ones((3,)),
+            "decoder.norm_out.gamma": mx.ones((96, 1, 1, 1)),
+        }
+        s = sanitize_helios_vae_weights(w)
+        assert "decoder.conv1.weight" in s
+        assert "decoder.conv1.bias" in s
+        assert "decoder.head.2.weight" in s
+        assert "decoder.head.2.bias" in s
+        assert "decoder.head.0.gamma" in s
+
+    def test_mid_block_mapping(self):
+        from mlx_video.convert_helios import sanitize_helios_vae_weights
+
+        w = {
+            "decoder.mid_block.resnets.0.norm1.gamma": mx.ones((384, 1, 1, 1)),
+            "decoder.mid_block.resnets.0.conv1.weight": mx.ones((384, 384, 3, 3, 3)),
+            "decoder.mid_block.attentions.0.norm.gamma": mx.ones((384, 1, 1)),
+            "decoder.mid_block.resnets.1.conv2.bias": mx.ones((384,)),
+        }
+        s = sanitize_helios_vae_weights(w)
+        assert "decoder.middle.0.residual.0.gamma" in s
+        assert "decoder.middle.0.residual.2.weight" in s
+        assert "decoder.middle.1.norm.gamma" in s
+        assert "decoder.middle.2.residual.6.bias" in s
+
+    def test_up_blocks_resnet_mapping(self):
+        from mlx_video.convert_helios import sanitize_helios_vae_weights
+
+        w = {
+            "decoder.up_blocks.0.resnets.0.norm1.gamma": mx.ones((384, 1, 1, 1)),
+            "decoder.up_blocks.0.resnets.1.conv2.weight": mx.ones((384, 384, 3, 3, 3)),
+            "decoder.up_blocks.1.resnets.0.conv_shortcut.weight": mx.ones((384, 192, 1, 1, 1)),
+        }
+        s = sanitize_helios_vae_weights(w)
+        assert "decoder.upsamples.0.residual.0.gamma" in s
+        assert "decoder.upsamples.1.residual.6.weight" in s
+        assert "decoder.upsamples.4.shortcut.weight" in s
+
+    def test_upsampler_mapping(self):
+        from mlx_video.convert_helios import sanitize_helios_vae_weights
+
+        w = {
+            "decoder.up_blocks.0.upsamplers.0.resample.1.weight": mx.ones((192, 384, 3, 3)),
+            "decoder.up_blocks.0.upsamplers.0.time_conv.weight": mx.ones((768, 384, 3, 1, 1)),
+        }
+        s = sanitize_helios_vae_weights(w)
+        assert "decoder.upsamples.3.resample.1.weight" in s
+        assert "decoder.upsamples.3.time_conv.weight" in s
+
+    def test_skips_encoder_keys(self):
+        from mlx_video.convert_helios import sanitize_helios_vae_weights
+
+        w = {
+            "encoder.conv_in.weight": mx.ones((384, 3, 3, 3, 3)),
+            "encoder.mid_block.resnets.0.conv1.weight": mx.ones((384, 384, 3, 3, 3)),
+        }
+        s = sanitize_helios_vae_weights(w)
+        assert len(s) == 0
