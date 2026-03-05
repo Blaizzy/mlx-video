@@ -128,7 +128,7 @@ def generate_video(
     output_path: str = "output_helios.mp4",
     tiling: str = "auto",
     amplify_first_chunk: bool = False,
-    guidance_scale: float = 5.0,
+    guidance_scale: float = 1.0,
     negative_prompt: str = "",
 ):
     """Generate video using Helios autoregressive pipeline with pyramid denoising.
@@ -258,18 +258,21 @@ def generate_video(
 
     print(f"{Colors.DIM}  Text embedding + KV cache: ready{Colors.RESET}")
 
-    # 4. History setup
+    # 4. History setup (keep_first_frame=True matching reference)
     history_sizes = config.history_sizes  # [16, 2, 1]
     num_history_frames = sum(history_sizes)  # 19 latent frames of history
     history_latents = mx.zeros((config.in_dim, num_history_frames, h_latent, w_latent))
 
-    # Frame indices: [history_long | history_mid | history_short | current]
-    total_indices = sum(history_sizes) + num_latent_per_chunk
+    # Frame indices with prefix: [prefix | history_long | history_mid | history_1x | current]
+    # Reference uses keep_first_frame=True which adds a prefix frame to short history
+    total_indices = 1 + sum(history_sizes) + num_latent_per_chunk  # +1 for prefix
     indices = mx.arange(total_indices)
-    idx_long = indices[:history_sizes[0]]  # [0..15]
-    idx_mid = indices[history_sizes[0]:history_sizes[0] + history_sizes[1]]  # [16..17]
-    idx_short = indices[history_sizes[0] + history_sizes[1]:sum(history_sizes)]  # [18]
-    idx_current = indices[sum(history_sizes):]  # [19..27]
+    idx_prefix = indices[:1]                                       # [0]
+    idx_long = indices[1:1 + history_sizes[0]]                     # [1..16]
+    idx_mid = indices[1 + history_sizes[0]:1 + history_sizes[0] + history_sizes[1]]  # [17..18]
+    idx_1x = indices[1 + history_sizes[0] + history_sizes[1]:1 + sum(history_sizes)]  # [19]
+    idx_short = mx.concatenate([idx_prefix, idx_1x])               # [0, 19]
+    idx_current = indices[1 + sum(history_sizes):]                  # [20..28]
 
     # 5. Initialize scheduler
     from mlx_video.models.helios.scheduler import HeliosScheduler
@@ -286,17 +289,27 @@ def generate_video(
     print(f"\n{Colors.BLUE}Generating {num_chunks} chunks ({sum(pyramid_steps)} steps/chunk, 3-stage pyramid)...{Colors.RESET}")
     all_latent_chunks = []
     total_generated = 0
+    image_latents_prefix = None  # Set after first chunk for keep_first_frame
 
     for chunk_idx in range(num_chunks):
         t_chunk = time.time()
         is_first = chunk_idx == 0
 
-        # Prepare history from accumulated latents
-        hist_long, hist_mid, hist_short = mx.split(
+        # Prepare history from accumulated latents (keep_first_frame=True)
+        hist_long, hist_mid, hist_1x = mx.split(
             history_latents[:, -num_history_frames:],
             [history_sizes[0], history_sizes[0] + history_sizes[1]],
             axis=1,
         )
+
+        # Prefix is zero for first chunk (no image conditioning), otherwise first frame
+        if is_first:
+            latents_prefix = mx.zeros((config.in_dim, 1, h_latent, w_latent))
+        else:
+            latents_prefix = image_latents_prefix
+
+        # Short history = prefix + 1x history (2 frames)
+        hist_short = mx.concatenate([latents_prefix, hist_1x], axis=1)
 
         # Initialize noise for this chunk at full resolution
         noise = mx.random.normal((config.in_dim, num_latent_per_chunk, h_latent, w_latent))
@@ -354,7 +367,13 @@ def generate_video(
                     config.patch_size, gamma,
                 )
                 latents = alpha * latents + beta * block_noise
-                start_point_list.append(latents)
+                # Use fresh noise for DMD re-noising start point.
+                # The blended signal (alpha*denoised + beta*noise) causes
+                # variance inflation when used as the re-noising target in
+                # step_dmd, leading to color distortion.
+                start_point_list.append(
+                    mx.random.normal(latents.shape)
+                )
 
             # History is always passed at full resolution — the Conv3d
             # patchifiers handle the spatial mismatch between history and
@@ -362,13 +381,14 @@ def generate_video(
             h_short, h_mid, h_long = hist_short, hist_mid, hist_long
 
             # Scale frame indices to match current spatial resolution
-            cur_idx = mx.arange(num_latent_per_chunk) + sum(history_sizes)
+            cur_idx = idx_current  # [20..28] with prefix offset
             cur_idx_short = idx_short
             cur_idx_mid = idx_mid
             cur_idx_long = idx_long
 
             for idx, t in enumerate(timesteps):
-                timestep = t
+                # Reference casts timestep to int64 before model call
+                timestep = mx.array(int(t.item()), dtype=mx.int32)
                 noise_pred = model(
                     latents=latents,
                     timestep=timestep,
@@ -416,6 +436,10 @@ def generate_video(
         # Update history: append this chunk's latents
         total_generated += num_latent_per_chunk
         history_latents = mx.concatenate([history_latents, latents], axis=1)
+
+        # After first chunk, save first frame as prefix for subsequent chunks
+        if is_first and image_latents_prefix is None:
+            image_latents_prefix = latents[:, 0:1, :, :]
 
         chunk_time = time.time() - t_chunk
         step_count = sum(pyramid_steps)
@@ -502,7 +526,7 @@ def main():
         choices=["auto", "none", "default", "aggressive", "conservative"],
         help="VAE tiling mode for memory efficiency",
     )
-    parser.add_argument("--guidance-scale", type=float, default=5.0, help="CFG guidance scale (1.0 = no CFG)")
+    parser.add_argument("--guidance-scale", type=float, default=1.0, help="CFG guidance scale (1.0 = no CFG, default for distilled)")
     parser.add_argument("--negative-prompt", type=str, default="", help="Negative prompt for CFG")
     args = parser.parse_args()
 

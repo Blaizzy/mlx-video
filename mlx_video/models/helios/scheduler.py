@@ -205,6 +205,9 @@ class HeliosScheduler:
     ) -> mx.array:
         """DMD step: predict x0 from flow, optionally re-noise.
 
+        Uses float32 for x0 prediction to avoid catastrophic cancellation
+        when sigma ≈ 1 (matching reference which uses float64).
+
         Args:
             model_output: Flow prediction from model
             sample: Current noisy latent (x_t)
@@ -214,7 +217,11 @@ class HeliosScheduler:
         Returns:
             Denoised or re-noised sample
         """
-        # Convert flow prediction to x0: x0 = x_t - sigma_t * flow
+        # Upcast to float32 to avoid precision loss in x0 = xt - sigma*flow
+        orig_dtype = model_output.dtype
+        model_output = model_output.astype(mx.float32)
+        sample = sample.astype(mx.float32)
+
         sigma_t = self.sigmas[cur_step]
         x0_pred = sample - sigma_t * model_output
 
@@ -222,6 +229,7 @@ class HeliosScheduler:
         if cur_step < num_timesteps - 1:
             # Re-noise: blend x0_pred with original noisy tensor at next sigma
             sigma_next = self.sigmas[cur_step + 1]
+            noisy_start = noisy_start.astype(mx.float32)
             prev_sample = (1 - sigma_next) * x0_pred + sigma_next * noisy_start
         else:
             prev_sample = x0_pred

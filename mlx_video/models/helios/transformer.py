@@ -194,7 +194,7 @@ class HeliosModel(nn.Module):
                 qk_norm=config.qk_norm,
                 cross_attn_norm=config.cross_attn_norm,
                 eps=config.eps,
-                restrict_self_attn=True,
+                restrict_self_attn=False,
             )
             for _ in range(config.num_layers)
         ]
