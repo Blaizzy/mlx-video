@@ -205,8 +205,9 @@ class HeliosScheduler:
     ) -> mx.array:
         """DMD step: predict x0 from flow, optionally re-noise.
 
-        Uses float32 for x0 prediction to avoid catastrophic cancellation
-        when sigma ≈ 1 (matching reference which uses float64).
+        Matches reference: x0 computed in float64, re-noising in float32.
+        Returns float32 to keep latent precision across steps (reference
+        returns float32 from add_noise's .type_as(noise)).
 
         Args:
             model_output: Flow prediction from model
@@ -215,27 +216,27 @@ class HeliosScheduler:
             noisy_start: Original noisy tensor for this stage (for re-noising)
 
         Returns:
-            Denoised or re-noised sample
+            Denoised or re-noised sample (float32)
         """
-        # Upcast to float32 to avoid precision loss in x0 = xt - sigma*flow
-        orig_dtype = model_output.dtype
+        # Upcast to float32 for x0 = xt - sigma*flow (reference uses float64
+        # but MLX GPU doesn't support float64; float32 is adequate here)
         model_output = model_output.astype(mx.float32)
         sample = sample.astype(mx.float32)
 
-        sigma_t = self.sigmas[cur_step]
+        sigma_t = float(self.sigmas[cur_step])
         x0_pred = sample - sigma_t * model_output
 
         num_timesteps = len(self.timesteps)
         if cur_step < num_timesteps - 1:
             # Re-noise: blend x0_pred with original noisy tensor at next sigma
-            sigma_next = self.sigmas[cur_step + 1]
+            sigma_next = float(self.sigmas[cur_step + 1])
             noisy_start = noisy_start.astype(mx.float32)
             prev_sample = (1 - sigma_next) * x0_pred + sigma_next * noisy_start
         else:
             prev_sample = x0_pred
 
         self._step_index = cur_step + 1
-        return prev_sample.astype(orig_dtype)
+        return prev_sample
 
     def step(
         self,

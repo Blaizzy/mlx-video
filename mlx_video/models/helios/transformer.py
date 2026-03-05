@@ -454,9 +454,12 @@ class HeliosModel(nn.Module):
             (1, 6, original_context_length, self.dim),
         )
 
-        # Zero history timestep embedding
+        # Zero history timestep embedding (timestep=0 → sinusoidal [cos(0), sin(0)] = [1,...,1, 0,...,0])
         if self.zero_history_timestep and history_seq_len > 0:
-            t0_emb = mx.zeros_like(t_emb)
+            t0_emb = mx.array([0.0]) * self._inv_freq
+            t0_emb = mx.concatenate([mx.cos(t0_emb), mx.sin(t0_emb)], axis=-1)
+            if t0_emb.ndim == 1:
+                t0_emb = t0_emb[None, :]
             temb_t0 = self.time_embedding_1(
                 self.time_embedding_act(self.time_embedding_0(t0_emb))
             )
