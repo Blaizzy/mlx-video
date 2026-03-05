@@ -46,6 +46,7 @@ Issues = "https://github.com/Blaizzy/mlx-video/issues"
 [project.scripts]
 "mlx_video.generate" = "mlx_video.generate:main"
 "mlx_video.generate_wan" = "mlx_video.generate_wan:main"
+"mlx_video.generate_helios" = "mlx_video.generate_helios:main"
 
 [tool.setuptools.packages.find]
 include = ["mlx_video*"]
