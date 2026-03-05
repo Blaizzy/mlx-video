@@ -271,6 +271,54 @@ Output frame analysis:
 but is mild. This appears to be inherent model behavior, not a bug. The per-channel
 growth is within the VAE's normalization range and decodes to warm, plausible colors.
 
+### Bug 10: Uniform color output — wrong zero-history timestep embedding
+
+**Symptom**: Output video showed near-uniform red/orange color (R=114, G=59, B=17 with
+very low per-channel variance). No recognizable content despite plausible color range.
+
+**Root cause**: The zero-history timestep embedding was computed incorrectly. The reference
+passes `timestep=0` through the sinusoidal `Timesteps()` encoder which produces
+`[cos(0), sin(0)] = [1,1,...,1, 0,0,...,0]` (128 ones followed by 128 zeros). Our code
+used `mx.zeros_like(t_emb)` — all zeros — which produces a completely different MLP output.
+
+Since history tokens make up ~81.6% of all tokens (2400 out of 2940 at 1/4 resolution),
+the vast majority of tokens received wrong scale/shift/gate modulation vectors from the
+`scale_shift_table`. This corrupted self-attention (history and current tokens interact),
+making the transformer output effectively random.
+
+**Diagnosis** (block-by-block comparison against reference PyTorch):
+1. Verified all inputs to the transformer match: patches, RoPE, text embeddings, time
+   embeddings, history patches — all cosine_sim ≈ 1.0
+2. Block 0 output diverged catastrophically: cosine_sim = -0.30 (essentially uncorrelated)
+3. Traced the bug to `HeliosModel.__call__` line 459 where `t0_emb = mx.zeros_like(t_emb)`
+   should have been the sinusoidal encoding of timestep=0
+
+**Fix** (commit `061f191b`):
+```python
+# Before (wrong):
+t0_emb = mx.zeros_like(t_emb)
+
+# After (correct):
+t0_emb = mx.array([0.0]) * self._inv_freq
+t0_emb = mx.concatenate([mx.cos(t0_emb), mx.sin(t0_emb)], axis=-1)
+```
+
+**Result**: Block 0 cosine similarity: -0.30 → 0.999982. Full pipeline output now shows
+recognizable structured content with high per-channel variance (R=100±100, G=81±81, B=33±37).
+
+### Bug 11: Scheduler step_dmd returning bfloat16
+
+**Symptom**: Minor precision loss across denoising steps (contributed to warm color bias
+but not the primary cause of bad output).
+
+**Root cause**: `step_dmd()` cast the result back to `orig_dtype` (bfloat16) at the end.
+The reference keeps latents in float32 between steps. Since the DMD formula
+`prev = (1-σ)·x0 + σ·start_point` involves near-cancellation when σ≈1, float32 precision
+is important.
+
+**Fix** (commit `061f191b`): Return float32 from `step_dmd()`, use `float()` for sigma
+values to avoid array overhead.
+
 ---
 
 ## Open Problems
@@ -285,12 +333,9 @@ removed, the multi-chunk behavior may have changed.
 
 ### 2. Color warmth / saturation
 
-**Status**: Output shows warm tones that are plausible for "sunset" prompts but may be
-warm-biased for neutral prompts. Cannot verify without reference CUDA output.
-
-**Unknown**: Whether the reference PyTorch code also produces warm-biased output for the same
-prompt and seed. The growing channel means may be inherent to the model's behavior with the
-distilled DMD scheduler.
+**Status**: RESOLVED by Bug 10 fix. The uniform warm color was caused by the wrong
+zero-history timestep embedding, not inherent model behavior. Output now shows proper
+color variation matching the prompt.
 
 ### 3. Generation speed
 
