@@ -128,6 +128,8 @@ def generate_video(
     output_path: str = "output_helios.mp4",
     tiling: str = "auto",
     amplify_first_chunk: bool = False,
+    guidance_scale: float = 5.0,
+    negative_prompt: str = "",
 ):
     """Generate video using Helios autoregressive pipeline with pyramid denoising.
 
@@ -142,6 +144,8 @@ def generate_video(
         output_path: Output video path
         tiling: VAE tiling mode: auto, none, default, aggressive, conservative
         amplify_first_chunk: Double steps for first chunk (better quality)
+        guidance_scale: CFG guidance scale (1.0 = no CFG, 5.0 = default)
+        negative_prompt: Negative prompt for CFG (empty string = unconditional)
     """
     from mlx_video.models.helios.config import HeliosModelConfig
 
@@ -197,7 +201,7 @@ def generate_video(
     print(f"\n{Colors.CYAN}Helios Video Generation{Colors.RESET}")
     print(f"  Prompt: {prompt[:80]}{'...' if len(prompt) > 80 else ''}")
     print(f"  Resolution: {width}x{height}, {num_frames} frames ({num_chunks} chunks)")
-    print(f"  Pyramid steps: {pyramid_steps} ({sum(pyramid_steps)} total/chunk), Seed: {seed}")
+    print(f"  Pyramid steps: {pyramid_steps} ({sum(pyramid_steps)} total/chunk), Seed: {seed}, Guidance: {guidance_scale}")
     if quantization:
         print(f"  Quantization: {quantization['bits']}-bit, group_size={quantization['group_size']}")
 
@@ -218,7 +222,14 @@ def generate_video(
     encoder = load_t5_encoder(t5_path, config)
     context = encode_text(encoder, tokenizer, prompt, text_len=config.text_len)
     mx.eval(context)
-    print(f"{Colors.DIM}  T5 encode: {time.time() - t2:.1f}s, tokens: {context.shape[0]}{Colors.RESET}")
+
+    do_cfg = guidance_scale > 1.0
+    negative_context = None
+    if do_cfg:
+        negative_context = encode_text(encoder, tokenizer, negative_prompt, text_len=config.text_len)
+        mx.eval(negative_context)
+
+    print(f"{Colors.DIM}  T5 encode: {time.time() - t2:.1f}s, tokens: {context.shape[0]}{', CFG enabled' if do_cfg else ''}{Colors.RESET}")
 
     del encoder
     gc.collect()
@@ -236,6 +247,15 @@ def generate_video(
     mx.eval(context_embedded)
     cross_kv_caches = model.prepare_cross_kv(context_embedded)
     mx.eval(*[v for kv in cross_kv_caches for v in kv])
+
+    negative_context_embedded = None
+    negative_cross_kv_caches = None
+    if do_cfg:
+        negative_context_embedded = model.embed_text([negative_context])
+        mx.eval(negative_context_embedded)
+        negative_cross_kv_caches = model.prepare_cross_kv(negative_context_embedded)
+        mx.eval(*[v for kv in negative_cross_kv_caches for v in kv])
+
     print(f"{Colors.DIM}  Text embedding + KV cache: ready{Colors.RESET}")
 
     # 4. History setup
@@ -336,14 +356,10 @@ def generate_video(
                 latents = alpha * latents + beta * block_noise
                 start_point_list.append(latents)
 
-            # Recompute history at current resolution
-            ds_factor = h_latent // cur_h
-            if ds_factor > 1:
-                h_short = _downsample_history(hist_short, ds_factor)
-                h_mid = _downsample_history(hist_mid, ds_factor)
-                h_long = _downsample_history(hist_long, ds_factor)
-            else:
-                h_short, h_mid, h_long = hist_short, hist_mid, hist_long
+            # History is always passed at full resolution — the Conv3d
+            # patchifiers handle the spatial mismatch between history and
+            # current latents since they are concatenated in sequence dim.
+            h_short, h_mid, h_long = hist_short, hist_mid, hist_long
 
             # Scale frame indices to match current spatial resolution
             cur_idx = mx.arange(num_latent_per_chunk) + sum(history_sizes)
@@ -353,7 +369,7 @@ def generate_video(
 
             for idx, t in enumerate(timesteps):
                 timestep = t
-                model_output = model(
+                noise_pred = model(
                     latents=latents,
                     timestep=timestep,
                     encoder_hidden_states=context_embedded,
@@ -366,10 +382,27 @@ def generate_video(
                     history_long_indices=cur_idx_long,
                     cross_kv_caches=cross_kv_caches,
                 )
-                mx.eval(model_output)
+                mx.eval(noise_pred)
+
+                if do_cfg:
+                    noise_uncond = model(
+                        latents=latents,
+                        timestep=timestep,
+                        encoder_hidden_states=negative_context_embedded,
+                        frame_indices=cur_idx,
+                        history_short=h_short,
+                        history_mid=h_mid,
+                        history_long=h_long,
+                        history_short_indices=cur_idx_short,
+                        history_mid_indices=cur_idx_mid,
+                        history_long_indices=cur_idx_long,
+                        cross_kv_caches=negative_cross_kv_caches,
+                    )
+                    mx.eval(noise_uncond)
+                    noise_pred = noise_uncond + guidance_scale * (noise_pred - noise_uncond)
 
                 latents = scheduler.step_dmd(
-                    model_output=model_output,
+                    model_output=noise_pred,
                     sample=latents,
                     cur_step=idx,
                     noisy_start=start_point_list[i_s],
@@ -429,6 +462,15 @@ def generate_video(
 
     # Convert to numpy: video is [1, 3, T, H, W] in [-1, 1]
     video = np.array(video[0])  # [3, T, H, W]
+
+    # Trim VAE warmup frames: causal padding produces stride_t-1 garbage frames at start
+    warmup_frames = vae_stride_t - 1  # 3
+    total_decoded = video.shape[1]
+    valid_frames = (total_latent_frames - 1) * vae_stride_t + 1
+    trim_start = total_decoded - valid_frames
+    if trim_start > 0:
+        video = video[:, trim_start:]
+
     video = (video + 1.0) / 2.0
     video = np.clip(video * 255.0, 0, 255).astype(np.uint8)
     video = video.transpose(1, 2, 3, 0)  # [T, H, W, 3]
@@ -460,6 +502,8 @@ def main():
         choices=["auto", "none", "default", "aggressive", "conservative"],
         help="VAE tiling mode for memory efficiency",
     )
+    parser.add_argument("--guidance-scale", type=float, default=5.0, help="CFG guidance scale (1.0 = no CFG)")
+    parser.add_argument("--negative-prompt", type=str, default="", help="Negative prompt for CFG")
     args = parser.parse_args()
 
     generate_video(
@@ -473,6 +517,8 @@ def main():
         output_path=args.output_path,
         tiling=args.tiling,
         amplify_first_chunk=args.amplify_first_chunk,
+        guidance_scale=args.guidance_scale,
+        negative_prompt=args.negative_prompt,
     )
 
 

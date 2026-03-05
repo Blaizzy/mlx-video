@@ -1,6 +1,6 @@
 # Helios — Text-to-Video Generation on Apple Silicon
 
-Helios is a 14B-parameter autoregressive video generation model that produces minute-scale, temporally coherent video. This implementation targets the **Helios-Distilled** variant (fastest, x0-prediction, no classifier-free guidance) for text-to-video generation on Apple Silicon via MLX.
+Helios is a 14B-parameter autoregressive video generation model that produces minute-scale, temporally coherent video. This implementation targets the **Helios-Distilled** variant for text-to-video generation on Apple Silicon via MLX.
 
 ## Quick Start
 
@@ -43,6 +43,8 @@ python -m mlx_video.generate_helios \
 | `--num-frames` | `99` | Number of output frames (auto-rounded to multiple of 33) |
 | `--pyramid-steps` | `2 2 2` | Steps per pyramid stage (3-stage progressive denoising) |
 | `--amplify-first-chunk` | off | Double steps for first chunk (better quality) |
+| `--guidance-scale` | `5.0` | CFG guidance scale (`1.0` = no guidance, `5.0` = default) |
+| `--negative-prompt` | `""` | Negative prompt for classifier-free guidance |
 | `--seed` | `-1` | Random seed (`-1` for random) |
 | `--output-path` | `output_helios.mp4` | Output video file path |
 | `--tiling` | `auto` | VAE tiling mode: `auto`, `none`, `default`, `aggressive`, `conservative` |
