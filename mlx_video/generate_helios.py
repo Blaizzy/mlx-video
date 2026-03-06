@@ -620,26 +620,27 @@ def generate_video(
 
     print(f"{Colors.DIM}  VAE decode: {time.time() - t4:.1f}s{Colors.RESET}")
 
-    # Correct contrast drop at chunk boundaries caused by VAE causal padding warmup.
-    # The first few frames of each non-first chunk have ~7% lower contrast (std dev)
-    # because the causal temporal convolutions lack context. We match their contrast
-    # to the previous chunk's last frame with a smooth linear ramp.
+    # Correct brightness/contrast discontinuity at chunk boundaries caused by VAE
+    # causal padding warmup. The first few frames of each non-first chunk have ~7%
+    # lower contrast and slight per-channel color shifts. We match per-channel mean
+    # and std dev to the previous chunk's last frame with a smooth linear ramp.
     if len(video_chunks) > 1:
         blend_n = 6  # frames over which to ramp correction
         for i in range(1, len(video_chunks)):
             ref_frame = video_chunks[i - 1][:, -1]  # [3, H, W]
-            ref_std = ref_frame.std()
-            if ref_std < 1e-6:
-                continue
+            # Per-channel stats of reference frame
+            ref_mean = ref_frame.mean(axis=(1, 2), keepdims=True)  # [3, 1, 1]
+            ref_std = ref_frame.std(axis=(1, 2), keepdims=True)
             for k in range(min(blend_n, video_chunks[i].shape[1])):
                 frame = video_chunks[i][:, k]
-                cur_std = frame.std()
-                if cur_std < 1e-6:
-                    continue
+                cur_mean = frame.mean(axis=(1, 2), keepdims=True)
+                cur_std = frame.std(axis=(1, 2), keepdims=True)
+                cur_std = np.maximum(cur_std, 1e-6)
                 w = 1.0 - k / blend_n  # 1.0 → 0.0
-                scale = 1.0 + w * (ref_std / cur_std - 1.0)
-                frame_mean = frame.mean()
-                video_chunks[i][:, k] = (frame - frame_mean) * scale + frame_mean
+                # Blend toward reference stats
+                target_mean = cur_mean + w * (ref_mean - cur_mean)
+                target_std = cur_std + w * (ref_std - cur_std)
+                video_chunks[i][:, k] = (frame - cur_mean) * (target_std / cur_std) + target_mean
 
     # Pixel-space cross-fade at chunk boundaries to smooth transitions.
     # Unlike latent-space blending, this is clean — no grid artifacts since
