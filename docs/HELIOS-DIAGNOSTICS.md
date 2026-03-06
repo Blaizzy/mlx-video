@@ -325,19 +325,22 @@ values to avoid array overhead.
 
 ### 1. Chunk boundary blur artifacts
 
-**Status**: MITIGATED. First few latent frames of each new chunk have ~45% less spatial
-detail than peak frames due to lack of temporal context during denoising. This is inherent
-to autoregressive chunking.
+**Status**: Improved via per-chunk VAE decoding. First few latent frames of each new chunk
+have ~45% less spatial detail than peak frames due to lack of temporal context during
+denoising. This is inherent to autoregressive chunking — the reference has the same
+limitation and does **no post-processing** at chunk boundaries.
 
-**Mitigation**: Latent-space temporal blend (`--chunk-blend N`, default 2). Before VAE
-decode, blends the first N latent frames of each new chunk toward the last frame of the
-previous chunk using a linear ramp: `w = (k+1)/(N+1)` per frame k. The VAE's temporal
-convolutions further smooth the transition.
+**Key finding**: The reference decodes each chunk independently (9 latent frames at a time),
+then concatenates pixel frames. Our initial approach of decoding the full concatenated
+latent sequence caused the VAE's causal temporal convolutions to propagate quality
+discontinuities across chunk boundaries, adding secondary artifacts (grid, brightness).
 
-With `--chunk-blend 2` (default):
-- Boundary latent frame: 33% original + 67% previous sharp frame
-- Next latent frame: 67% original + 33% previous sharp frame
-- Use `--chunk-blend 0` to disable
+**Current approach**: Per-chunk VAE decoding (matching reference). Each chunk is decoded
+independently with fresh causal padding, producing cleaner boundary transitions.
+
+**Optional**: Latent-space blend (`--chunk-blend N`, default 0 = off). Blends the first N
+latent frames of each new chunk toward the previous chunk's last frame. Generally not
+recommended as it introduces its own artifacts (grid patterns, brightness shift).
 
 ### 2. Color warmth / saturation
 

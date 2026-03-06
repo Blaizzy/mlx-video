@@ -146,7 +146,7 @@ def generate_video(
     amplify_first_chunk: bool = False,
     guidance_scale: float = 1.0,
     negative_prompt: str = "",
-    chunk_blend: int = 2,
+    chunk_blend: int = 0,
     debug: bool = False,
 ):
     """Generate video using Helios autoregressive pipeline with pyramid denoising.
@@ -509,7 +509,7 @@ def generate_video(
     if tiling == "none":
         tiling_config = None
     elif tiling == "auto":
-        tiling_config = TilingConfig.auto(height, width, num_frames)
+        tiling_config = TilingConfig.auto(height, width, frames_per_chunk)
     elif tiling == "default":
         tiling_config = TilingConfig.default()
     elif tiling == "aggressive":
@@ -517,53 +517,54 @@ def generate_video(
     elif tiling == "conservative":
         tiling_config = TilingConfig.conservative()
     else:
-        tiling_config = TilingConfig.auto(height, width, num_frames)
+        tiling_config = TilingConfig.auto(height, width, frames_per_chunk)
 
-    # Concatenate all chunks: each is [C, F_lat, H_lat, W_lat]
-    all_latents = mx.concatenate(all_latent_chunks, axis=1)  # [C, total_F_lat, H_lat, W_lat]
-
-    # Smooth chunk boundaries in latent space: first latent frames of each new chunk
-    # are blurrier (and may show grid/brightness artifacts) due to lack of temporal
-    # context. We blend them toward the previous chunk's last frame to transfer
-    # spatial detail, then correct per-channel mean to prevent brightness shift.
+    # Optional: smooth chunk boundaries in latent space (off by default).
+    # When enabled, blends first N latent frames of each new chunk toward
+    # the previous chunk's last frame to reduce quality discontinuity.
     if chunk_blend > 0 and num_chunks > 1:
         blend_n = min(chunk_blend, num_latent_per_chunk - 1)
-        latent_np = np.array(all_latents)
         for b in range(1, num_chunks):
-            boundary = b * num_latent_per_chunk
-            ref = latent_np[:, boundary - 1].copy()  # [C, H, W]
-            for k in range(min(blend_n, latent_np.shape[1] - boundary)):
-                target = latent_np[:, boundary + k]
-                # Gentle ramp: 40% reference at boundary, decreasing for later frames
+            ref_np = np.array(all_latent_chunks[b - 1][:, -1])  # [C, H, W]
+            chunk_np = np.array(all_latent_chunks[b])  # [C, F, H, W]
+            for k in range(min(blend_n, chunk_np.shape[1])):
+                target = chunk_np[:, k]
                 ref_weight = 0.4 * (blend_n - k) / blend_n
-                blended = (1 - ref_weight) * target + ref_weight * ref
-                # Correct per-channel mean to match target (prevents brightness shift
-                # while keeping the detail/std boost from blending)
+                blended = (1 - ref_weight) * target + ref_weight * ref_np
                 for c in range(blended.shape[0]):
                     blended[c] += target[c].mean() - blended[c].mean()
-                latent_np[:, boundary + k] = blended
-        all_latents = mx.array(latent_np)
+                chunk_np[:, k] = blended
+            all_latent_chunks[b] = mx.array(chunk_np)
         print(f"{Colors.DIM}  Applied chunk boundary blend ({blend_n} latent frames){Colors.RESET}")
 
-    # Decode: WanVAE expects [B, C, T, H, W], handles denormalization internally
-    z = all_latents[None, :, :, :, :]  # [1, C, T, H, W]
-    if tiling_config is not None:
-        video = vae.decode_tiled(z, tiling_config)
-    else:
-        video = vae.decode(z)
-    mx.eval(video)
+    # Decode each chunk independently (matching reference behavior).
+    # Per-chunk decoding avoids cross-chunk VAE temporal convolution artifacts
+    # that occur when the quality discontinuity at boundaries hits the causal conv.
+    video_chunks = []
+    for ci, chunk_latents in enumerate(all_latent_chunks):
+        z = chunk_latents[None, :, :, :, :]  # [1, C, 9, H_lat, W_lat]
+        if tiling_config is not None:
+            chunk_video = vae.decode_tiled(z, tiling_config)
+        else:
+            chunk_video = vae.decode(z)
+        mx.eval(chunk_video)
+
+        chunk_np = np.array(chunk_video[0])  # [3, T_decoded, H, W]
+        # Trim VAE warmup frames (causal padding produces stride_t-1 garbage at start)
+        valid = (num_latent_per_chunk - 1) * vae_stride_t + 1  # 33
+        trim = chunk_np.shape[1] - valid
+        if trim > 0:
+            chunk_np = chunk_np[:, trim:]
+        video_chunks.append(chunk_np)
+
+        del chunk_video, z
+        gc.collect()
+        mx.clear_cache()
+
     print(f"{Colors.DIM}  VAE decode: {time.time() - t4:.1f}s{Colors.RESET}")
 
-    # Convert to numpy: video is [1, 3, T, H, W] in [-1, 1]
-    video = np.array(video[0])  # [3, T, H, W]
-
-    # Trim VAE warmup frames: causal padding produces stride_t-1 garbage frames at start
-    warmup_frames = vae_stride_t - 1  # 3
-    total_decoded = video.shape[1]
-    valid_frames = (total_latent_frames - 1) * vae_stride_t + 1
-    trim_start = total_decoded - valid_frames
-    if trim_start > 0:
-        video = video[:, trim_start:]
+    # Concatenate pixel frames from all chunks
+    video = np.concatenate(video_chunks, axis=1)  # [3, T_total, H, W]
 
     video = (video + 1.0) / 2.0
     video = np.clip(video * 255.0, 0, 255).astype(np.uint8)
@@ -598,7 +599,7 @@ def main():
     )
     parser.add_argument("--guidance-scale", type=float, default=1.0, help="CFG guidance scale (1.0 = no CFG, default for distilled)")
     parser.add_argument("--negative-prompt", type=str, default="", help="Negative prompt for CFG")
-    parser.add_argument("--chunk-blend", type=int, default=2, help="Latent frames to blend at chunk boundaries (0=off, default=2)")
+    parser.add_argument("--chunk-blend", type=int, default=0, help="Latent frames to blend at chunk boundaries (0=off, default=0)")
     parser.add_argument("--debug", action="store_true", help="Print per-step latent statistics for debugging")
     args = parser.parse_args()
 
