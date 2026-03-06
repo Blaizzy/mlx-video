@@ -523,17 +523,25 @@ def generate_video(
     all_latents = mx.concatenate(all_latent_chunks, axis=1)  # [C, total_F_lat, H_lat, W_lat]
 
     # Smooth chunk boundaries in latent space: first latent frames of each new chunk
-    # are blurrier due to lack of temporal context. Blend them toward the last frame
-    # of the previous chunk, which the VAE then further smooths via temporal convolution.
+    # are blurrier (and may show grid/brightness artifacts) due to lack of temporal
+    # context. We blend them toward the previous chunk's last frame to transfer
+    # spatial detail, then correct per-channel mean to prevent brightness shift.
     if chunk_blend > 0 and num_chunks > 1:
         blend_n = min(chunk_blend, num_latent_per_chunk - 1)
         latent_np = np.array(all_latents)
         for b in range(1, num_chunks):
             boundary = b * num_latent_per_chunk
-            ref = latent_np[:, boundary - 1].copy()
+            ref = latent_np[:, boundary - 1].copy()  # [C, H, W]
             for k in range(min(blend_n, latent_np.shape[1] - boundary)):
-                w = (k + 1) / (blend_n + 1)
-                latent_np[:, boundary + k] = w * latent_np[:, boundary + k] + (1 - w) * ref
+                target = latent_np[:, boundary + k]
+                # Gentle ramp: 40% reference at boundary, decreasing for later frames
+                ref_weight = 0.4 * (blend_n - k) / blend_n
+                blended = (1 - ref_weight) * target + ref_weight * ref
+                # Correct per-channel mean to match target (prevents brightness shift
+                # while keeping the detail/std boost from blending)
+                for c in range(blended.shape[0]):
+                    blended[c] += target[c].mean() - blended[c].mean()
+                latent_np[:, boundary + k] = blended
         all_latents = mx.array(latent_np)
         print(f"{Colors.DIM}  Applied chunk boundary blend ({blend_n} latent frames){Colors.RESET}")
 
