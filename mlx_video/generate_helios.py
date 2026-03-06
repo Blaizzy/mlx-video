@@ -146,6 +146,7 @@ def generate_video(
     amplify_first_chunk: bool = False,
     guidance_scale: float = 1.0,
     negative_prompt: str = "",
+    chunk_blend: int = 2,
     debug: bool = False,
 ):
     """Generate video using Helios autoregressive pipeline with pyramid denoising.
@@ -163,6 +164,7 @@ def generate_video(
         amplify_first_chunk: Double steps for first chunk (better quality)
         guidance_scale: CFG guidance scale (1.0 = no CFG, 5.0 = default)
         negative_prompt: Negative prompt for CFG (empty string = unconditional)
+        chunk_blend: Number of latent frames to blend at chunk boundaries (0 to disable)
     """
     from mlx_video.models.helios.config import HeliosModelConfig
 
@@ -520,6 +522,21 @@ def generate_video(
     # Concatenate all chunks: each is [C, F_lat, H_lat, W_lat]
     all_latents = mx.concatenate(all_latent_chunks, axis=1)  # [C, total_F_lat, H_lat, W_lat]
 
+    # Smooth chunk boundaries in latent space: first latent frames of each new chunk
+    # are blurrier due to lack of temporal context. Blend them toward the last frame
+    # of the previous chunk, which the VAE then further smooths via temporal convolution.
+    if chunk_blend > 0 and num_chunks > 1:
+        blend_n = min(chunk_blend, num_latent_per_chunk - 1)
+        latent_np = np.array(all_latents)
+        for b in range(1, num_chunks):
+            boundary = b * num_latent_per_chunk
+            ref = latent_np[:, boundary - 1].copy()
+            for k in range(min(blend_n, latent_np.shape[1] - boundary)):
+                w = (k + 1) / (blend_n + 1)
+                latent_np[:, boundary + k] = w * latent_np[:, boundary + k] + (1 - w) * ref
+        all_latents = mx.array(latent_np)
+        print(f"{Colors.DIM}  Applied chunk boundary blend ({blend_n} latent frames){Colors.RESET}")
+
     # Decode: WanVAE expects [B, C, T, H, W], handles denormalization internally
     z = all_latents[None, :, :, :, :]  # [1, C, T, H, W]
     if tiling_config is not None:
@@ -573,6 +590,7 @@ def main():
     )
     parser.add_argument("--guidance-scale", type=float, default=1.0, help="CFG guidance scale (1.0 = no CFG, default for distilled)")
     parser.add_argument("--negative-prompt", type=str, default="", help="Negative prompt for CFG")
+    parser.add_argument("--chunk-blend", type=int, default=2, help="Latent frames to blend at chunk boundaries (0=off, default=2)")
     parser.add_argument("--debug", action="store_true", help="Print per-step latent statistics for debugging")
     args = parser.parse_args()
 
@@ -589,6 +607,7 @@ def main():
         amplify_first_chunk=args.amplify_first_chunk,
         guidance_scale=args.guidance_scale,
         negative_prompt=args.negative_prompt,
+        chunk_blend=args.chunk_blend,
         debug=args.debug,
     )
 

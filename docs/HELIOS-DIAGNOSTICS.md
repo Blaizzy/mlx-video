@@ -323,13 +323,21 @@ values to avoid array overhead.
 
 ## Open Problems
 
-### 1. Multi-chunk temporal stability
+### 1. Chunk boundary blur artifacts
 
-**Status**: Not re-tested after Bug 9 fix. Previously showed instability in chunk 2
-(dark frame at midpoint, inconsistent colors). Now that start-point normalization is
-removed, the multi-chunk behavior may have changed.
+**Status**: MITIGATED. First few latent frames of each new chunk have ~45% less spatial
+detail than peak frames due to lack of temporal context during denoising. This is inherent
+to autoregressive chunking.
 
-**Next step**: Test with 99 frames (3 chunks) and evaluate chunk transitions.
+**Mitigation**: Latent-space temporal blend (`--chunk-blend N`, default 2). Before VAE
+decode, blends the first N latent frames of each new chunk toward the last frame of the
+previous chunk using a linear ramp: `w = (k+1)/(N+1)` per frame k. The VAE's temporal
+convolutions further smooth the transition.
+
+With `--chunk-blend 2` (default):
+- Boundary latent frame: 33% original + 67% previous sharp frame
+- Next latent frame: 67% original + 33% previous sharp frame
+- Use `--chunk-blend 0` to disable
 
 ### 2. Color warmth / saturation
 
