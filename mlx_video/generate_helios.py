@@ -620,6 +620,27 @@ def generate_video(
 
     print(f"{Colors.DIM}  VAE decode: {time.time() - t4:.1f}s{Colors.RESET}")
 
+    # Correct contrast drop at chunk boundaries caused by VAE causal padding warmup.
+    # The first few frames of each non-first chunk have ~7% lower contrast (std dev)
+    # because the causal temporal convolutions lack context. We match their contrast
+    # to the previous chunk's last frame with a smooth linear ramp.
+    if len(video_chunks) > 1:
+        blend_n = 6  # frames over which to ramp correction
+        for i in range(1, len(video_chunks)):
+            ref_frame = video_chunks[i - 1][:, -1]  # [3, H, W]
+            ref_std = ref_frame.std()
+            if ref_std < 1e-6:
+                continue
+            for k in range(min(blend_n, video_chunks[i].shape[1])):
+                frame = video_chunks[i][:, k]
+                cur_std = frame.std()
+                if cur_std < 1e-6:
+                    continue
+                w = 1.0 - k / blend_n  # 1.0 → 0.0
+                scale = 1.0 + w * (ref_std / cur_std - 1.0)
+                frame_mean = frame.mean()
+                video_chunks[i][:, k] = (frame - frame_mean) * scale + frame_mean
+
     # Pixel-space cross-fade at chunk boundaries to smooth transitions.
     # Unlike latent-space blending, this is clean — no grid artifacts since
     # the VAE decode has already resolved block noise patterns.
