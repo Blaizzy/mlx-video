@@ -404,6 +404,12 @@ uses no cross-fade. Disabling it matches reference boundary behavior.
 - `--crossfade-frames 0` (OFF by default): Can be re-enabled if desired but not recommended
   based on reference comparison.
 
+**Note — Resolution sensitivity**: The model was only trained at 384×640. Using non-default
+resolutions (even valid multiples of 64, like 640×384 portrait) causes obvious frame jumps
+in the reference pipeline too. This is a known upstream limitation
+([PKU-YuanGroup/Helios#2](https://github.com/PKU-YuanGroup/Helios/issues/2)). Residual
+zoom with complex prompts at the default resolution is also an inherent model behavior.
+
 ### 6. Non-distilled model not supported
 
 Only the distilled model (DMD scheduler, 2+2+2 steps, no CFG) is implemented. The
