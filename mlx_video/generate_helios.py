@@ -148,7 +148,7 @@ def generate_video(
     negative_prompt: str = "",
     chunk_blend: int = 0,
     anti_drifting: bool = False,
-    anti_drift_strength: float = 0.1,
+    anti_drift_blend: float = 0.5,
     debug: bool = False,
 ):
     """Generate video using Helios autoregressive pipeline with pyramid denoising.
@@ -168,7 +168,7 @@ def generate_video(
         negative_prompt: Negative prompt for CFG (empty string = unconditional)
         chunk_blend: Number of latent frames to blend at chunk boundaries (0 to disable)
         anti_drifting: Enable adaptive anti-drifting for temporal consistency
-        anti_drift_strength: Noise strength for anti-drifting correction (default 0.1)
+        anti_drift_blend: How much to normalize history toward EMA (0=off, 0.5=half, 1.0=full)
     """
     from mlx_video.models.helios.config import HeliosModelConfig
 
@@ -488,11 +488,13 @@ def generate_video(
         pbar.close()
         mx.eval(latents)
 
-        # Adaptive anti-drifting: detect and correct latent statistics drift
-        # between chunks to maintain temporal consistency (matching reference).
+        # Adaptive anti-drifting: normalize history latent statistics to prevent
+        # color/style drift between chunks. Clean latents are kept for decoding;
+        # only the history copy is normalized toward the running EMA.
+        history_latents_chunk = latents  # default: same as output
         if anti_drifting and num_chunks > 1:
-            # Compute per-channel mean/var: latents is [C, F, H, W]
             lat_f32 = latents.astype(mx.float32)
+            # Per-channel stats: latents is [C, F, H, W]
             cur_mean = mx.mean(lat_f32, axis=(1, 2, 3))  # [C]
             cur_var = mx.var(lat_f32, axis=(1, 2, 3))  # [C]
             mx.eval(cur_mean, cur_var)
@@ -501,29 +503,38 @@ def generate_video(
                 drift_global_mean = cur_mean
                 drift_global_var = cur_var
             else:
-                # Detect drift: L2 norm of deviation from EMA
+                # Update EMA BEFORE detection (matching reference order)
+                drift_global_mean = drift_rho * drift_global_mean + (1 - drift_rho) * cur_mean
+                drift_global_var = drift_rho * drift_global_var + (1 - drift_rho) * cur_var
+
+                # Detect drift: L2 norm of deviation from updated EMA
                 mean_drift = float(mx.sqrt(mx.sum((cur_mean - drift_global_mean) ** 2)).item())
                 var_drift = float(mx.sqrt(mx.sum((cur_var - drift_global_var) ** 2)).item())
                 has_drift = mean_drift > 0.15 and var_drift > 0.15
 
                 if has_drift and chunk_idx < num_chunks - 1:
-                    # Add noise to prevent further drift in subsequent chunks
-                    noise = mx.random.normal(latents.shape)
-                    latents = latents + anti_drift_strength * noise
-                    mx.eval(latents)
-                    print(f"{Colors.DIM}  ⚠ Drift detected (mean={mean_drift:.3f}, var={var_drift:.3f}), applied correction{Colors.RESET}")
+                    # Normalize history copy toward EMA (deterministic, no noise)
+                    # Per-channel: shift mean and scale variance
+                    cur_mean_4d = cur_mean[:, None, None, None]
+                    cur_std_4d = mx.sqrt(mx.maximum(cur_var, mx.array(1e-8)))[:, None, None, None]
+                    global_mean_4d = drift_global_mean[:, None, None, None]
+                    global_std_4d = mx.sqrt(mx.maximum(drift_global_var, mx.array(1e-8)))[:, None, None, None]
+
+                    # Standardize, then rescale to target stats
+                    normalized = (latents - cur_mean_4d) / cur_std_4d * global_std_4d + global_mean_4d
+                    # Blend: 0 = keep raw, 1 = fully normalize to EMA
+                    history_latents_chunk = (1 - anti_drift_blend) * latents + anti_drift_blend * normalized
+                    history_latents_chunk = history_latents_chunk.astype(latents.dtype)
+                    mx.eval(history_latents_chunk)
+                    print(f"{Colors.DIM}  ⚠ Drift detected (mean={mean_drift:.3f}, var={var_drift:.3f}), normalized history{Colors.RESET}")
                 elif debug:
                     print(f"  [drift] mean={mean_drift:.3f}, var={var_drift:.3f}, threshold=0.15")
 
-                # Update EMA
-                drift_global_mean = drift_rho * drift_global_mean + (1 - drift_rho) * cur_mean
-                drift_global_var = drift_rho * drift_global_var + (1 - drift_rho) * cur_var
+        all_latent_chunks.append(latents)  # clean latents for decoding
 
-        all_latent_chunks.append(latents)
-
-        # Update history: append this chunk's latents
+        # Update history: use potentially normalized chunk for conditioning
         total_generated += num_latent_per_chunk
-        history_latents = mx.concatenate([history_latents, latents], axis=1)
+        history_latents = mx.concatenate([history_latents, history_latents_chunk], axis=1)
 
         # After first chunk, save first frame as prefix for subsequent chunks
         if is_first and image_latents_prefix is None:
@@ -642,7 +653,7 @@ def main():
     parser.add_argument("--negative-prompt", type=str, default="", help="Negative prompt for CFG")
     parser.add_argument("--chunk-blend", type=int, default=0, help="Latent frames to blend at chunk boundaries (0=off, default=0)")
     parser.add_argument("--anti-drifting", action="store_true", help="Enable adaptive anti-drifting for temporal consistency between chunks")
-    parser.add_argument("--anti-drift-strength", type=float, default=0.1, help="Noise strength for anti-drifting correction (default=0.1)")
+    parser.add_argument("--anti-drift-blend", type=float, default=0.5, help="How much to normalize history toward EMA stats (0=off, 0.5=half, 1.0=full; default=0.5)")
     parser.add_argument("--debug", action="store_true", help="Print per-step latent statistics for debugging")
     args = parser.parse_args()
 
@@ -661,7 +672,7 @@ def main():
         negative_prompt=args.negative_prompt,
         chunk_blend=args.chunk_blend,
         anti_drifting=args.anti_drifting,
-        anti_drift_strength=args.anti_drift_strength,
+        anti_drift_blend=args.anti_drift_blend,
         debug=args.debug,
     )
 

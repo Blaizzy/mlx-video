@@ -350,18 +350,23 @@ color variation matching the prompt.
 
 ### 3. Adaptive anti-drifting for temporal consistency
 
-**Status**: Implemented (`--anti-drifting` flag). Ports the reference's `AdaptiveAntiDrifting`
-mechanism to prevent color/style drift across chunks in long videos.
+**Status**: Implemented (`--anti-drifting` flag). Prevents color/style drift across chunks in
+long videos by normalizing history latent statistics toward a running average.
 
 **How it works**:
 - Tracks per-channel latent mean/variance via EMA (momentum=0.9) across chunks
-- After each chunk: computes L2 norm of deviation from running average
-- If BOTH mean drift > 0.15 AND variance drift > 0.15: adds Gaussian noise to the chunk's
-  latents (default strength=0.1) before saving to history
-- This forces subsequent chunks to re-anchor to the global statistics
-- Only triggers on non-final chunks (last chunk doesn't need correction)
+- After each chunk: computes L2 norm of deviation from updated EMA
+- If BOTH mean drift > 0.15 AND variance drift > 0.15 AND not last chunk:
+  - Normalizes the **history copy** (not the decoded output) per-channel to match the EMA
+  - `normalized = (latents - cur_mean) / cur_std * global_std + global_mean`
+  - Controlled by `--anti-drift-blend` (0=off, 0.5=half-normalize, 1.0=full normalize)
+- Clean latents are always kept for decoding — no output quality impact
+- Only the history conditioning is adjusted, gently steering future chunks
 
-**Usage**: `--anti-drifting` to enable, `--anti-drift-strength 0.1` to control noise amplitude.
+**Previous approach** (noise corruption, commit `a9fd911d`) was reverted because adding
+Gaussian noise degraded output quality and cascaded noise into subsequent chunks via history.
+
+**Usage**: `--anti-drifting` to enable, `--anti-drift-blend 0.5` (default) to control strength.
 Off by default (matching reference).
 
 ### 4. Generation speed
