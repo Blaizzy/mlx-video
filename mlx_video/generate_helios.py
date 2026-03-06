@@ -143,10 +143,11 @@ def generate_video(
     seed: int = -1,
     output_path: str = "output_helios.mp4",
     tiling: str = "auto",
-    amplify_first_chunk: bool = False,
+    amplify_first_chunk: bool = True,
     guidance_scale: float = 1.0,
     negative_prompt: str = "",
     chunk_blend: int = 0,
+    crossfade_frames: int = 4,
     anti_drifting: bool = False,
     anti_drift_blend: float = 0.5,
     debug: bool = False,
@@ -163,10 +164,11 @@ def generate_video(
         seed: Random seed (-1 for random)
         output_path: Output video path
         tiling: VAE tiling mode: auto, none, default, aggressive, conservative
-        amplify_first_chunk: Double steps for first chunk (better quality)
+        amplify_first_chunk: Double steps for first chunk (recommended for distilled model)
         guidance_scale: CFG guidance scale (1.0 = no CFG, 5.0 = default)
         negative_prompt: Negative prompt for CFG (empty string = unconditional)
         chunk_blend: Number of latent frames to blend at chunk boundaries (0 to disable)
+        crossfade_frames: Number of pixel frames to cross-fade between chunks (0 to disable)
         anti_drifting: Enable adaptive anti-drifting for temporal consistency
         anti_drift_blend: How much to normalize history toward EMA (0=off, 0.5=half, 1.0=full)
     """
@@ -615,6 +617,18 @@ def generate_video(
 
     print(f"{Colors.DIM}  VAE decode: {time.time() - t4:.1f}s{Colors.RESET}")
 
+    # Pixel-space cross-fade at chunk boundaries to smooth transitions.
+    # Unlike latent-space blending, this is clean — no grid artifacts since
+    # the VAE decode has already resolved block noise patterns.
+    if crossfade_frames > 0 and len(video_chunks) > 1:
+        cf = min(crossfade_frames, video_chunks[0].shape[1] - 1)
+        for i in range(1, len(video_chunks)):
+            for k in range(cf):
+                # Linear ramp: weight 1→0 for previous chunk, 0→1 for current
+                w = (k + 1) / (cf + 1)
+                video_chunks[i][:, k] = (1 - w) * video_chunks[i - 1][:, -(cf - k)] + w * video_chunks[i][:, k]
+        print(f"{Colors.DIM}  Applied pixel cross-fade ({cf} frames at each boundary){Colors.RESET}")
+
     # Concatenate pixel frames from all chunks
     video = np.concatenate(video_chunks, axis=1)  # [3, T_total, H, W]
 
@@ -641,7 +655,8 @@ def main():
         "--pyramid-steps", type=int, nargs="+", default=[2, 2, 2],
         help="Steps per pyramid stage (default: 2 2 2 for distilled, total 6 forward passes)",
     )
-    parser.add_argument("--amplify-first-chunk", action="store_true", help="Double steps for first chunk (better quality)")
+    parser.add_argument("--amplify-first-chunk", action="store_true", default=True, help="Double steps for first chunk (default: on, recommended for distilled)")
+    parser.add_argument("--no-amplify-first-chunk", action="store_false", dest="amplify_first_chunk", help="Disable first chunk amplification")
     parser.add_argument("--seed", type=int, default=-1, help="Random seed")
     parser.add_argument("--output-path", type=str, default="output_helios.mp4", help="Output video path")
     parser.add_argument(
@@ -652,6 +667,7 @@ def main():
     parser.add_argument("--guidance-scale", type=float, default=1.0, help="CFG guidance scale (1.0 = no CFG, default for distilled)")
     parser.add_argument("--negative-prompt", type=str, default="", help="Negative prompt for CFG")
     parser.add_argument("--chunk-blend", type=int, default=0, help="Latent frames to blend at chunk boundaries (0=off, default=0)")
+    parser.add_argument("--crossfade-frames", type=int, default=4, help="Pixel frames to cross-fade between chunks (0=off, default=4)")
     parser.add_argument("--anti-drifting", action="store_true", help="Enable adaptive anti-drifting for temporal consistency between chunks")
     parser.add_argument("--anti-drift-blend", type=float, default=0.5, help="How much to normalize history toward EMA stats (0=off, 0.5=half, 1.0=full; default=0.5)")
     parser.add_argument("--debug", action="store_true", help="Print per-step latent statistics for debugging")
@@ -671,6 +687,7 @@ def main():
         guidance_scale=args.guidance_scale,
         negative_prompt=args.negative_prompt,
         chunk_blend=args.chunk_blend,
+        crossfade_frames=args.crossfade_frames,
         anti_drifting=args.anti_drifting,
         anti_drift_blend=args.anti_drift_blend,
         debug=args.debug,

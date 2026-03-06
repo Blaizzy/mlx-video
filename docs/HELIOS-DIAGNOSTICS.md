@@ -379,13 +379,25 @@ Off by default (matching reference).
 - Quantization (model supports 4/8-bit via convert_helios.py)
 - Memory-efficient attention
 
-### 4. `amplify_first_chunk` not tested
+### 5. Camera jumps at chunk boundaries
 
-The reference recommends `--is-amplify-first-chunk` for distilled models. This doubles the
-DMD timestep expansion for the first chunk (2n+1 steps instead of n+1). Not yet tested in
-our pipeline.
+**Status**: Mitigated with two defaults, inherent to autoregressive generation.
 
-### 5. Non-distilled model not supported
+Objects may appear to shift spatial scale or "jump in" at chunk boundaries. This is NOT a bug
+— thorough comparison with the reference confirms identical schedules, indices, history
+handling, and DMD steps. It's an inherent limitation of autoregressive chunked generation
+where each chunk has limited temporal context.
+
+**Mitigations applied**:
+- `--amplify-first-chunk` (now ON by default): Doubles DMD steps for the first chunk,
+  providing a higher-quality anchor for subsequent chunks via history. Reference ALWAYS uses
+  this for distilled models.
+- `--crossfade-frames 4` (default 4): Pixel-space linear cross-fade at chunk boundaries.
+  Blends the last N frames of chunk K with the first N of chunk K+1. Applied in pixel space
+  so there are no grid artifacts (unlike latent-space blending). Use `--crossfade-frames 0`
+  to disable.
+
+### 6. Non-distilled model not supported
 
 Only the distilled model (DMD scheduler, 2+2+2 steps, no CFG) is implemented. The
 non-distilled model uses Euler/UniPC schedulers with 20+20+20 steps and requires CFG.
