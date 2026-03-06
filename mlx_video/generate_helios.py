@@ -147,7 +147,7 @@ def generate_video(
     guidance_scale: float = 1.0,
     negative_prompt: str = "",
     chunk_blend: int = 0,
-    crossfade_frames: int = 4,
+    crossfade_frames: int = 0,
     anti_drifting: bool = False,
     anti_drift_blend: float = 0.5,
     debug: bool = False,
@@ -667,7 +667,7 @@ def main():
     parser.add_argument("--guidance-scale", type=float, default=1.0, help="CFG guidance scale (1.0 = no CFG, default for distilled)")
     parser.add_argument("--negative-prompt", type=str, default="", help="Negative prompt for CFG")
     parser.add_argument("--chunk-blend", type=int, default=0, help="Latent frames to blend at chunk boundaries (0=off, default=0)")
-    parser.add_argument("--crossfade-frames", type=int, default=4, help="Pixel frames to cross-fade between chunks (0=off, default=4)")
+    parser.add_argument("--crossfade-frames", type=int, default=0, help="Pixel frames to cross-fade between chunks (0=off, default=0)")
     parser.add_argument("--anti-drifting", action="store_true", help="Enable adaptive anti-drifting for temporal consistency between chunks")
     parser.add_argument("--anti-drift-blend", type=float, default=0.5, help="How much to normalize history toward EMA stats (0=off, 0.5=half, 1.0=full; default=0.5)")
     parser.add_argument("--debug", action="store_true", help="Print per-step latent statistics for debugging")
