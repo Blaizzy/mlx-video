@@ -609,6 +609,9 @@ def generate_video(
         trim = chunk_np.shape[1] - valid
         if trim > 0:
             chunk_np = chunk_np[:, trim:]
+        # Drop first pixel frame: it's the overlap/conditioning frame from history
+        # (distorted duplicate of previous chunk's last frame). 33→32 = exact 2s at 16fps.
+        chunk_np = chunk_np[:, 1:]
         video_chunks.append(chunk_np)
 
         del chunk_video, z
