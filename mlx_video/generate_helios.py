@@ -17,6 +17,7 @@ from pathlib import Path
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
+import cv2
 from tqdm import tqdm
 
 from mlx_video.models.helios.loading import (
@@ -621,26 +622,42 @@ def generate_video(
     print(f"{Colors.DIM}  VAE decode: {time.time() - t4:.1f}s{Colors.RESET}")
 
     # Correct brightness/contrast discontinuity at chunk boundaries caused by VAE
-    # causal padding warmup. The first few frames of each non-first chunk have ~7%
-    # lower contrast and slight per-channel color shifts. We match per-channel mean
-    # and std dev to the previous chunk's last frame with a smooth linear ramp.
+    # causal padding warmup. Two-stage correction:
+    # 1. Spatially-varying brightness: match low-frequency (blurred) brightness per
+    #    channel to the previous chunk's last frame, fixing the "face darkens while
+    #    background brightens" effect from the VAE's spatial redistribution.
+    # 2. Per-channel contrast: scale std dev to match, fixing the ~7% contrast drop.
     if len(video_chunks) > 1:
         blend_n = 6  # frames over which to ramp correction
+        blur_size = 16  # downscale factor for low-frequency brightness map
         for i in range(1, len(video_chunks)):
             ref_frame = video_chunks[i - 1][:, -1]  # [3, H, W]
-            # Per-channel stats of reference frame
-            ref_mean = ref_frame.mean(axis=(1, 2), keepdims=True)  # [3, 1, 1]
+            _, fh, fw = ref_frame.shape
+            # Pre-compute low-frequency brightness map of reference
+            small_h, small_w = max(fh // blur_size, 1), max(fw // blur_size, 1)
+            ref_lf = np.zeros((3, small_h, small_w), dtype=np.float32)
+            for c in range(3):
+                ref_lf[c] = cv2.resize(ref_frame[c], (small_w, small_h), interpolation=cv2.INTER_AREA)
+            # Per-channel global stats
             ref_std = ref_frame.std(axis=(1, 2), keepdims=True)
+
             for k in range(min(blend_n, video_chunks[i].shape[1])):
                 frame = video_chunks[i][:, k]
-                cur_mean = frame.mean(axis=(1, 2), keepdims=True)
+                ramp = 1.0 - k / blend_n  # 1.0 → 0.0
+
+                # Stage 1: spatially-varying brightness correction
+                for c in range(3):
+                    cur_lf = cv2.resize(frame[c], (small_w, small_h), interpolation=cv2.INTER_AREA)
+                    diff_small = ref_lf[c] - cur_lf
+                    diff_full = cv2.resize(diff_small, (fw, fh), interpolation=cv2.INTER_LINEAR)
+                    frame[c] = frame[c] + ramp * diff_full
+
+                # Stage 2: per-channel contrast correction
                 cur_std = frame.std(axis=(1, 2), keepdims=True)
                 cur_std = np.maximum(cur_std, 1e-6)
-                w = 1.0 - k / blend_n  # 1.0 → 0.0
-                # Blend toward reference stats
-                target_mean = cur_mean + w * (ref_mean - cur_mean)
-                target_std = cur_std + w * (ref_std - cur_std)
-                video_chunks[i][:, k] = (frame - cur_mean) * (target_std / cur_std) + target_mean
+                target_std = cur_std + ramp * (ref_std - cur_std)
+                cur_mean = frame.mean(axis=(1, 2), keepdims=True)
+                video_chunks[i][:, k] = (frame - cur_mean) * (target_std / cur_std) + cur_mean
 
     # Pixel-space cross-fade at chunk boundaries to smooth transitions.
     # Unlike latent-space blending, this is clean — no grid artifacts since
