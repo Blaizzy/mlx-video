@@ -123,24 +123,26 @@ class HeliosTransformerBlock(nn.Module):
             rope_cos_sin=rotary_emb,
             original_context_length=original_context_length,
         )
-        x = (x + attn_out * gate_msa)
+        # Residual in float32 to match reference (prevents systematic truncation
+        # of small updates in bfloat16, which compounds across chunks via history)
+        x = (x.astype(mx.float32) + attn_out * gate_msa).astype(w_dtype)
 
         # 2. Cross-attention (history tokens skip cross-attention)
         if self.guidance_cross_attn and history_seq_len > 0:
             history_x, current_x = x[:, :history_seq_len], x[:, history_seq_len:]
             norm_current = self.norm2(current_x) if self.norm2 is not None else current_x
             cross_out = self.cross_attn(norm_current, encoder_hidden_states, kv_cache=cross_kv_cache)
-            current_x = current_x + cross_out
+            current_x = (current_x.astype(mx.float32) + cross_out).astype(w_dtype)
             x = mx.concatenate([history_x, current_x], axis=1)
         else:
             norm_x = self.norm2(x) if self.norm2 is not None else x
             cross_out = self.cross_attn(norm_x, encoder_hidden_states, kv_cache=cross_kv_cache)
-            x = x + cross_out
+            x = (x.astype(mx.float32) + cross_out).astype(w_dtype)
 
         # 3. Feed-forward
         norm_x = (self.norm3(x) * (1 + c_scale) + c_shift).astype(w_dtype)
         ff_out = self.ffn(norm_x)
-        x = x + ff_out * c_gate
+        x = (x.astype(mx.float32) + ff_out.astype(mx.float32) * c_gate).astype(w_dtype)
 
         return x
 
