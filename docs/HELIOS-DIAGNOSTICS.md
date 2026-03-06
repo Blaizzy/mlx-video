@@ -348,7 +348,23 @@ recommended as it introduces its own artifacts (grid patterns, brightness shift)
 zero-history timestep embedding, not inherent model behavior. Output now shows proper
 color variation matching the prompt.
 
-### 3. Generation speed
+### 3. Adaptive anti-drifting for temporal consistency
+
+**Status**: Implemented (`--anti-drifting` flag). Ports the reference's `AdaptiveAntiDrifting`
+mechanism to prevent color/style drift across chunks in long videos.
+
+**How it works**:
+- Tracks per-channel latent mean/variance via EMA (momentum=0.9) across chunks
+- After each chunk: computes L2 norm of deviation from running average
+- If BOTH mean drift > 0.15 AND variance drift > 0.15: adds Gaussian noise to the chunk's
+  latents (default strength=0.1) before saving to history
+- This forces subsequent chunks to re-anchor to the global statistics
+- Only triggers on non-final chunks (last chunk doesn't need correction)
+
+**Usage**: `--anti-drifting` to enable, `--anti-drift-strength 0.1` to control noise amplitude.
+Off by default (matching reference).
+
+### 4. Generation speed
 
 **Status**: ~14s/step at 384×640 resolution. This is limited by the full-resolution stages
 (stages 0-1 at reduced resolution are fast: ~5s/step).

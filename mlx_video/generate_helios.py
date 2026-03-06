@@ -147,6 +147,8 @@ def generate_video(
     guidance_scale: float = 1.0,
     negative_prompt: str = "",
     chunk_blend: int = 0,
+    anti_drifting: bool = False,
+    anti_drift_strength: float = 0.1,
     debug: bool = False,
 ):
     """Generate video using Helios autoregressive pipeline with pyramid denoising.
@@ -165,6 +167,8 @@ def generate_video(
         guidance_scale: CFG guidance scale (1.0 = no CFG, 5.0 = default)
         negative_prompt: Negative prompt for CFG (empty string = unconditional)
         chunk_blend: Number of latent frames to blend at chunk boundaries (0 to disable)
+        anti_drifting: Enable adaptive anti-drifting for temporal consistency
+        anti_drift_strength: Noise strength for anti-drifting correction (default 0.1)
     """
     from mlx_video.models.helios.config import HeliosModelConfig
 
@@ -309,6 +313,11 @@ def generate_video(
     all_latent_chunks = []
     total_generated = 0
     image_latents_prefix = None  # Set after first chunk for keep_first_frame
+
+    # Adaptive anti-drifting: EMA of per-channel latent statistics
+    drift_global_mean = None
+    drift_global_var = None
+    drift_rho = 0.9  # EMA momentum
 
     for chunk_idx in range(num_chunks):
         t_chunk = time.time()
@@ -478,6 +487,38 @@ def generate_video(
 
         pbar.close()
         mx.eval(latents)
+
+        # Adaptive anti-drifting: detect and correct latent statistics drift
+        # between chunks to maintain temporal consistency (matching reference).
+        if anti_drifting and num_chunks > 1:
+            # Compute per-channel mean/var: latents is [C, F, H, W]
+            lat_f32 = latents.astype(mx.float32)
+            cur_mean = mx.mean(lat_f32, axis=(1, 2, 3))  # [C]
+            cur_var = mx.var(lat_f32, axis=(1, 2, 3))  # [C]
+            mx.eval(cur_mean, cur_var)
+
+            if drift_global_mean is None:
+                drift_global_mean = cur_mean
+                drift_global_var = cur_var
+            else:
+                # Detect drift: L2 norm of deviation from EMA
+                mean_drift = float(mx.sqrt(mx.sum((cur_mean - drift_global_mean) ** 2)).item())
+                var_drift = float(mx.sqrt(mx.sum((cur_var - drift_global_var) ** 2)).item())
+                has_drift = mean_drift > 0.15 and var_drift > 0.15
+
+                if has_drift and chunk_idx < num_chunks - 1:
+                    # Add noise to prevent further drift in subsequent chunks
+                    noise = mx.random.normal(latents.shape)
+                    latents = latents + anti_drift_strength * noise
+                    mx.eval(latents)
+                    print(f"{Colors.DIM}  ⚠ Drift detected (mean={mean_drift:.3f}, var={var_drift:.3f}), applied correction{Colors.RESET}")
+                elif debug:
+                    print(f"  [drift] mean={mean_drift:.3f}, var={var_drift:.3f}, threshold=0.15")
+
+                # Update EMA
+                drift_global_mean = drift_rho * drift_global_mean + (1 - drift_rho) * cur_mean
+                drift_global_var = drift_rho * drift_global_var + (1 - drift_rho) * cur_var
+
         all_latent_chunks.append(latents)
 
         # Update history: append this chunk's latents
@@ -600,6 +641,8 @@ def main():
     parser.add_argument("--guidance-scale", type=float, default=1.0, help="CFG guidance scale (1.0 = no CFG, default for distilled)")
     parser.add_argument("--negative-prompt", type=str, default="", help="Negative prompt for CFG")
     parser.add_argument("--chunk-blend", type=int, default=0, help="Latent frames to blend at chunk boundaries (0=off, default=0)")
+    parser.add_argument("--anti-drifting", action="store_true", help="Enable adaptive anti-drifting for temporal consistency between chunks")
+    parser.add_argument("--anti-drift-strength", type=float, default=0.1, help="Noise strength for anti-drifting correction (default=0.1)")
     parser.add_argument("--debug", action="store_true", help="Print per-step latent statistics for debugging")
     args = parser.parse_args()
 
@@ -617,6 +660,8 @@ def main():
         guidance_scale=args.guidance_scale,
         negative_prompt=args.negative_prompt,
         chunk_blend=args.chunk_blend,
+        anti_drifting=args.anti_drifting,
+        anti_drift_strength=args.anti_drift_strength,
         debug=args.debug,
     )
 
