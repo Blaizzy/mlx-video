@@ -47,7 +47,7 @@ VAE decode → video frames
 ### File layout (~2500 lines total)
 
 ```
-mlx_video/generate_helios.py          # Pipeline orchestration (554 lines)
+mlx_video/generate_helios.py          # Pipeline orchestration (~700 lines)
 mlx_video/models/helios/
   config.py        # HeliosModelConfig dataclass (69 lines)
   transformer.py   # 14B DiT backbone (511 lines)
@@ -57,6 +57,11 @@ mlx_video/models/helios/
   loading.py       # Weight loading wrappers (51 lines)
 mlx_video/convert_helios.py           # HF→MLX weight conversion
 tests/test_helios.py                  # 46 tests (554 lines)
+scripts/helios/
+  analyze_boundaries.py  # Boundary quality analysis (compare videos)
+  run_reference.py       # Run PyTorch reference pipeline on MPS
+  compare_pipelines.py   # Compare scheduler/pipeline mechanics
+  compare_models.py      # Cross-framework model output comparison
 ```
 
 ---
@@ -325,22 +330,43 @@ values to avoid array overhead.
 
 ### 1. Chunk boundary quality ✅ RESOLVED
 
-**Status**: Fixed. Boundary quality now matches the reference pipeline.
+**Status**: Fixed. Four-layer fix eliminates visible boundary artifacts.
 
-**Root cause**: Pixel cross-fade was blending the first N frames of each new chunk with the
-tail of the previous chunk. Since frames from different chunks don't spatially align, this
-created blur — causing a **40% sharpness drop** at every boundary. The reference pipeline
-uses **no cross-fade** at all.
+**Root cause (cross-fade)**: Pixel cross-fade was blending the first N frames of each new
+chunk with the tail of the previous chunk. Since frames from different chunks don't
+spatially align, this created blur — causing a **40% sharpness drop** at every boundary.
+The reference pipeline uses **no cross-fade** at all.
 
-**Key finding**: Reference comparison revealed the correct boundary pattern: the first frame
-of each chunk should be the **sharpest** (conditioned by high-quality history), not the
-blurriest. With cross-fade disabled, our boundary pattern now matches the reference:
-- Reference: boundary UP +16-21%, per-chunk means stable (5.2, 5.2, 5.5)
-- MLX (fixed): boundary UP +8%, per-chunk means stable (6.6, 6.8, 6.5)
-- MLX (old cross-fade): boundary DOWN -40%, declining means
+**Root cause (conditioning frame)**: The first pixel frame of each non-first chunk is a
+distorted reconstruction of the previous chunk's last frame (via history conditioning).
+The reference keeps it as a bridge frame, but it creates visual stutter. Dropping it gives
+exactly 32 frames per chunk = 2 seconds at 16 fps.
 
-**Current approach**: Per-chunk VAE decoding (matching reference), no cross-fade (default).
-Cross-fade still available via `--crossfade-frames N` but not recommended.
+**Root cause (VAE warmup)**: The WanVAE decoder uses causal temporal convolutions. When
+decoding each chunk independently, the first few frames lack temporal context (only zero
+padding). This causes a **~7% contrast drop** in the first frames of each chunk, plus a
+spatial brightness redistribution (face darkens, background brightens).
+
+**Fix layers** (applied in order during VAE decode):
+1. **No cross-fade** (default `--crossfade-frames 0`) — matches reference
+2. **First-frame trim** — drops conditioning frame from each chunk (33 → 32 frames)
+3. **Spatially-varying brightness correction** — matches low-frequency per-channel brightness
+   between chunks via downscale/diff/upscale additive correction (6-frame ramp)
+4. **Per-channel contrast correction** — scales std dev to match previous chunk's last frame
+
+**Results** (measured with `scripts/helios/analyze_boundaries.py`):
+| Metric | No fix | With all fixes |
+|--------|--------|----------------|
+| Contrast jump | -7.0% | **-1.0%** |
+| Brightness jump | +0.7% | **+0.0%** |
+| Max color shift | 1.8 px | **0.3 px** |
+| Frame diff ratio | 4.1× | **2.5×** |
+| Center brightness shift | -0.90 | **-0.15** |
+| Periphery brightness shift | +1.39 | **+0.09** |
+
+**Note**: VAE overlap decode (prepending previous chunk's last latent frames as temporal
+context) was tested but made things **worse** (22% contrast drop). The VAE's causal
+convolutions see conflicting content from different chunks and create larger artifacts.
 
 **Optional**: Latent-space blend (`--chunk-blend N`, default 0 = off). Generally not
 recommended as it introduces its own artifacts (grid patterns, brightness shift).
@@ -556,6 +582,48 @@ def _time_shift(mu, t):
 
 ## Diagnostic Recipes
 
+### Diagnostic scripts
+
+Consolidated diagnostic scripts live in `scripts/helios/`:
+
+| Script | Purpose |
+|--------|---------|
+| `analyze_boundaries.py` | Measure boundary quality (contrast, brightness, color, spatial). Compare multiple videos side-by-side. |
+| `run_reference.py` | Run the PyTorch reference pipeline on MPS for ground-truth comparison. Patches float64 → float32 for MPS. |
+| `compare_pipelines.py` | Compare scheduler/pipeline mechanics between MLX and PyTorch using identical dummy inputs. No model needed. |
+| `compare_models.py` | Feed identical inputs to both MLX and PyTorch transformer models and compare flow predictions. |
+
+**Analyze chunk boundaries** (most commonly used):
+
+```bash
+# Single video
+python scripts/helios/analyze_boundaries.py /tmp/helios_output.mp4
+
+# Compare before/after fix
+python scripts/helios/analyze_boundaries.py \
+    /tmp/before_fix.mp4 /tmp/after_fix.mp4
+
+# Reference pipeline uses 33 frames/chunk (no first-frame trim)
+python scripts/helios/analyze_boundaries.py --chunk-size 33 /tmp/ref.mp4
+```
+
+**Run reference pipeline for comparison**:
+
+```bash
+# Requires: pip install diffusers transformers torch accelerate
+python scripts/helios/run_reference.py \
+    --model-dir /path/to/Helios-Distilled \
+    --prompt "A golden retriever running on a sunny beach" \
+    --output /tmp/helios_ref.mp4
+```
+
+**Compare pipeline mechanics** (no model weights needed):
+
+```bash
+python scripts/helios/compare_pipelines.py \
+    --helios-dir /path/to/Helios
+```
+
 ### Check latent channel statistics per step
 
 Add this inside the denoising loop (after `scheduler.step_dmd`):
@@ -639,3 +707,18 @@ Expected output should match the values in the [Verified Components](#3-schedule
 | `fcefee27` | Add CFG support and VAE frame trimming |
 | `e61eb33b` | Fix pyramid color distortion (restrict_self_attn, float32 precision, int timestep) |
 | `c5acde72` | Fix color bias (normalized start_point + bfloat16 inputs) |
+| `24012f96` | Add diagnostics and engineering notes |
+| `35f700be` | Fix pure noise: remove start-point normalization, add debug mode |
+| `061f191b` | Fix zero-history timestep embedding and scheduler precision |
+| `d6f9b4e2` | Mitigate chunk boundary blur with latent-space temporal blend |
+| `38d454d0` | Switch to per-chunk VAE decoding, revert blend default to off |
+| `a9fd911d` | Implement adaptive anti-drifting for temporal consistency |
+| `a7c9086e` | Replace anti-drifting noise corruption with history normalization |
+| `4415b746` | Amplify first chunk + pixel cross-fade for camera jumps |
+| `b24d60a1` | Fix zoom bug: float32 residual connections in transformer blocks |
+| `f89eeeb9` | Disable pixel cross-fade by default (matches reference) |
+| `811c4deb` | Document resolution sensitivity as upstream model limitation |
+| `e60688fd` | Drop first pixel frame from each chunk to remove boundary distortion |
+| `a716216b` | Fix brightness jumps: global contrast correction at boundaries |
+| `ff101b2a` | Upgrade to per-channel brightness and contrast matching |
+| `8cb3ca96` | Add spatially-varying brightness correction at chunk boundaries |
