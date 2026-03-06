@@ -323,23 +323,26 @@ values to avoid array overhead.
 
 ## Open Problems
 
-### 1. Chunk boundary blur artifacts
+### 1. Chunk boundary quality ✅ RESOLVED
 
-**Status**: Improved via per-chunk VAE decoding. First few latent frames of each new chunk
-have ~45% less spatial detail than peak frames due to lack of temporal context during
-denoising. This is inherent to autoregressive chunking — the reference has the same
-limitation and does **no post-processing** at chunk boundaries.
+**Status**: Fixed. Boundary quality now matches the reference pipeline.
 
-**Key finding**: The reference decodes each chunk independently (9 latent frames at a time),
-then concatenates pixel frames. Our initial approach of decoding the full concatenated
-latent sequence caused the VAE's causal temporal convolutions to propagate quality
-discontinuities across chunk boundaries, adding secondary artifacts (grid, brightness).
+**Root cause**: Pixel cross-fade was blending the first N frames of each new chunk with the
+tail of the previous chunk. Since frames from different chunks don't spatially align, this
+created blur — causing a **40% sharpness drop** at every boundary. The reference pipeline
+uses **no cross-fade** at all.
 
-**Current approach**: Per-chunk VAE decoding (matching reference). Each chunk is decoded
-independently with fresh causal padding, producing cleaner boundary transitions.
+**Key finding**: Reference comparison revealed the correct boundary pattern: the first frame
+of each chunk should be the **sharpest** (conditioned by high-quality history), not the
+blurriest. With cross-fade disabled, our boundary pattern now matches the reference:
+- Reference: boundary UP +16-21%, per-chunk means stable (5.2, 5.2, 5.5)
+- MLX (fixed): boundary UP +8%, per-chunk means stable (6.6, 6.8, 6.5)
+- MLX (old cross-fade): boundary DOWN -40%, declining means
 
-**Optional**: Latent-space blend (`--chunk-blend N`, default 0 = off). Blends the first N
-latent frames of each new chunk toward the previous chunk's last frame. Generally not
+**Current approach**: Per-chunk VAE decoding (matching reference), no cross-fade (default).
+Cross-fade still available via `--crossfade-frames N` but not recommended.
+
+**Optional**: Latent-space blend (`--chunk-blend N`, default 0 = off). Generally not
 recommended as it introduces its own artifacts (grid patterns, brightness shift).
 
 ### 2. Color warmth / saturation
@@ -379,23 +382,27 @@ Off by default (matching reference).
 - Quantization (model supports 4/8-bit via convert_helios.py)
 - Memory-efficient attention
 
-### 5. Camera jumps at chunk boundaries
+### 5. Camera jumps at chunk boundaries ✅ RESOLVED
 
-**Status**: Mitigated with two defaults, inherent to autoregressive generation.
+**Status**: Fixed by two changes: float32 residual connections (commit b24d60a1) and
+disabling pixel cross-fade (commit f89eeeb9).
 
-Objects may appear to shift spatial scale or "jump in" at chunk boundaries. This is NOT a bug
-— thorough comparison with the reference confirms identical schedules, indices, history
-handling, and DMD steps. It's an inherent limitation of autoregressive chunked generation
-where each chunk has limited temporal context.
+**Root cause 1 — Gradual zoom**: bfloat16 residual connections systematically truncated
+high-frequency spatial content over 48 blocks × 3 residuals × 6 model calls per chunk.
+When smoothed output became history for the next chunk, the effect compounded → progressive
+zoom. Fixed by promoting residual additions to float32 (matching reference's `.float()`
+pattern).
 
-**Mitigations applied**:
-- `--amplify-first-chunk` (now ON by default): Doubles DMD steps for the first chunk,
+**Root cause 2 — Boundary jumps**: Pixel cross-fade blended frames from different chunks
+that didn't spatially align, creating visible blur/jumps at every boundary. The reference
+uses no cross-fade. Disabling it matches reference boundary behavior.
+
+**Mitigations retained**:
+- `--amplify-first-chunk` (ON by default): Doubles DMD steps for the first chunk,
   providing a higher-quality anchor for subsequent chunks via history. Reference ALWAYS uses
   this for distilled models.
-- `--crossfade-frames 4` (default 4): Pixel-space linear cross-fade at chunk boundaries.
-  Blends the last N frames of chunk K with the first N of chunk K+1. Applied in pixel space
-  so there are no grid artifacts (unlike latent-space blending). Use `--crossfade-frames 0`
-  to disable.
+- `--crossfade-frames 0` (OFF by default): Can be re-enabled if desired but not recommended
+  based on reference comparison.
 
 ### 6. Non-distilled model not supported
 
