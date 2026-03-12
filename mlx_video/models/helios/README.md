@@ -2,59 +2,77 @@
 
 Helios is a 14B-parameter autoregressive video generation model that produces minute-scale, temporally coherent video. This implementation targets the **Helios-Distilled** variant for text-to-video generation on Apple Silicon via MLX.
 
-## Quick Start
+### Step 1: Download Weights
 
-### 1. Convert Weights
-
-Download the HuggingFace checkpoint and convert to MLX format:
+Download the original PyTorch checkpoint from HuggingFace using the `huggingface-cli` tool (install with `pip install huggingface_hub`):
 
 ```bash
-python -m mlx_video.convert_helios \
-    --checkpoint-dir /path/to/BestWishYsh/Helios-Distilled \
-    --output-dir ./helios-mlx
+huggingface-cli download BestWishYsh/Helios-Distilled --local-dir ./Helios-Distilled
 ```
 
-With 4-bit quantization (~7 GB, fits 16 GB Macs):
+### Step 2: Convert to MLX Format
+
+Convert the PyTorch checkpoint to MLX format:
 
 ```bash
 python -m mlx_video.convert_helios \
-    --checkpoint-dir /path/to/BestWishYsh/Helios-Distilled \
-    --output-dir ./helios-mlx-4bit \
+    --checkpoint-dir ./Helios-Distilled \
+    --output-dir ./Helios-Distilled-MLX
+```
+
+#### Quantization (Reduced Memory)
+
+Quantize the transformer weights to reduce memory usage. With 4-bit quantization (~7 GB, fits 16 GB Macs):
+
+```bash
+python -m mlx_video.convert_helios \
+    --checkpoint-dir ./Helios-Distilled \
+    --output-dir ./Helios-Distilled-MLX-Q4 \
     --quantize --bits 4
 ```
 
-Or quantize an existing MLX model (skips HF conversion):
+You can also quantize an already-converted MLX model without re-converting from PyTorch:
 
 ```bash
 python -m mlx_video.convert_helios \
-    --checkpoint-dir ./helios-mlx \
-    --output-dir ./helios-mlx-4bit \
+    --checkpoint-dir ./Helios-Distilled-MLX \
+    --output-dir ./Helios-Distilled-MLX-Q4 \
     --quantize-only --bits 4
 ```
 
-### 2. Generate Video
+#### Conversion Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--checkpoint-dir` | (required) | Path to original PyTorch checkpoint directory |
+| `--output-dir` | `helios_mlx_model` | Output path for MLX model |
+| `--quantize` | off | Quantize transformer weights for reduced memory |
+| `--bits` | `4` | Quantization bits: `4` or `8` |
+| `--quantize-only` | off | Quantize an existing MLX model (skip PyTorch conversion) |
+
+### Step 3: Generate Video
 
 ```bash
 python -m mlx_video.generate_helios \
-    --model-dir ./helios-mlx \
+    --model-dir ./Helios-Distilled-MLX \
     --prompt "A golden retriever running through a sunlit meadow" \
     --output-path my_video.mp4
 ```
 
 ```bash
 python -m mlx_video.generate_helios \
-    --model-dir ../Helios-Distilled-MLX/ \
+    --model-dir ./Helios-Distilled-MLX \
     --num-frames 330 \
     --seed 2391784614 \
     --prompt "Two dogs of the poodle breed sitting on a beach wearing sunglasses, nodding with their heads, close up, cinematic, sunset"
 ```
 
-## CLI Options
+#### Generation Options
 
-| Flag | Default | Description |
-|---|---|---|
-| `--model-dir` | *(required)* | Path to converted MLX model directory |
-| `--prompt` | *(required)* | Text prompt describing the video |
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--model-dir` | (required) | Path to converted MLX model directory |
+| `--prompt` | (required) | Text prompt describing the video |
 | `--width` | `640` | Video width in pixels (must be divisible by 64) |
 | `--height` | `384` | Video height in pixels (must be divisible by 64) |
 | `--num-frames` | `99` | Number of output frames (auto-rounded to multiple of 33) |
@@ -62,7 +80,7 @@ python -m mlx_video.generate_helios \
 | `--amplify-first-chunk` | off | Double steps for first chunk (better quality) |
 | `--guidance-scale` | `5.0` | CFG guidance scale (`1.0` = no guidance, `5.0` = default) |
 | `--negative-prompt` | `""` | Negative prompt for classifier-free guidance |
-| `--seed` | `-1` | Random seed (`-1` for random) |
+| `--seed` | `-1` (random) | Random seed for reproducibility |
 | `--output-path` | `output_helios.mp4` | Output video file path |
 | `--tiling` | `auto` | VAE tiling mode: `auto`, `none`, `default`, `aggressive`, `conservative` |
 
@@ -165,6 +183,8 @@ Height and width must be divisible by 64. Recommended resolutions:
 | 384 × 640 | 3:5 | ~28 GB | ~7 GB |
 | 384 × 384 | 1:1 | ~24 GB | ~6 GB |
 | 256 × 448 | 9:16 | ~20 GB | ~5 GB |
+
+> **Note — Resolution sensitivity**: The model was only trained at 384×640. Using non-default resolutions (even valid multiples of 64, like 640×384 portrait) causes obvious frame jumps in the reference pipeline too. This is a known upstream limitation ([PKU-YuanGroup/Helios#2](https://github.com/PKU-YuanGroup/Helios/issues/2)). Residual zoom with complex prompts at the default resolution is also an inherent model behavior.
 
 ## Memory Tips
 
