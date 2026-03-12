@@ -27,8 +27,8 @@ from mlx_video.models.helios.loading import (
     load_t5_encoder,
     load_vae_decoder,
 )
-from mlx_video.postprocess import save_video
-from mlx_video.utils import Colors
+from mlx_video.models.wan.postprocess import save_video
+from mlx_video.generate_wan import Colors
 
 
 def sample_block_noise(
