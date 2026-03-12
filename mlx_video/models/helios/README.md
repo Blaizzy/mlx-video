@@ -32,6 +32,14 @@ python -m mlx_video.generate_helios \
     --output-path my_video.mp4
 ```
 
+```bash
+python -m mlx_video.generate_helios \
+    --model-dir /Volumes/SSD/BestWishYsh/Helios-Distilled-MLX/ \
+    --num-frames 330 \
+    --seed 2391784614 \
+    --prompt "Two dogs of the poodle breed sitting on a beach wearing sunglasses, nodding with their heads, close up, cinematic, sunset"
+```
+
 ## CLI Options
 
 | Flag | Default | Description |
