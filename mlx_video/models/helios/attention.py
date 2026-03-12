@@ -1,9 +1,6 @@
 import mlx.core as mx
 import mlx.nn as nn
 
-from .rope import helios_rope_apply
-
-
 def _linear_dtype(layer) -> mx.Dtype:
     """Get the compute dtype of a linear layer, handling QuantizedLinear and LoRA wrappers."""
     inner = getattr(layer, "linear", layer)
@@ -98,68 +95,40 @@ class HeliosSelfAttention(nn.Module):
             k = self.norm_k(k)
 
         if self.restrict_self_attn and history_seq_len > 0:
-            # Split history and current
-            q_hist, q_curr = q[:, :history_seq_len], q[:, history_seq_len:]
-            k_hist, k_curr = k[:, :history_seq_len], k[:, history_seq_len:]
-            v_hist = self.v(x_w[:, :history_seq_len])
-            v_curr = self.v(x_w[:, history_seq_len:])
+            # Single V projection on full sequence, then split
+            v = self.v(x_w).reshape(b, s, n, d)
+            v_hist = v[:, :history_seq_len]
+            v_curr = v[:, history_seq_len:]
 
-            # Reshape to multi-head
-            q_hist = q_hist.reshape(b, history_seq_len, n, d)
-            k_hist = k_hist.reshape(b, history_seq_len, n, d)
-            v_hist = v_hist.reshape(b, history_seq_len, n, d)
+            # Reshape Q/K to multi-head for full sequence
+            q = q.reshape(b, s, n, d)
+            k = k.reshape(b, s, n, d)
 
-            q_curr = q_curr.reshape(b, original_context_length, n, d)
-            k_curr = k_curr.reshape(b, original_context_length, n, d)
-            v_curr = v_curr.reshape(b, original_context_length, n, d)
-
-            # Apply RoPE to history and current separately
-            # History RoPE uses history portion of frame_indices
-            all_q = mx.concatenate([q_hist, q_curr], axis=1).reshape(b, s, n, d)
-            all_k = mx.concatenate([k_hist, k_curr], axis=1).reshape(b, s, n, d)
-
-            total_seq = history_seq_len + original_context_length
-            all_q = helios_rope_apply(
-                all_q.astype(mx.float32), frame_indices, (total_seq, 1, 1),
-                freqs, precomputed_cos_sin=rope_cos_sin,
-            ) if rope_cos_sin is not None else all_q
-            all_k = helios_rope_apply(
-                all_k.astype(mx.float32), frame_indices, (total_seq, 1, 1),
-                freqs, precomputed_cos_sin=rope_cos_sin,
-            ) if rope_cos_sin is not None else all_k
-
-            # Actually we need to use the full precomputed rope since it covers
-            # the concatenated history+current sequence.
-            # Let me simplify: apply RoPE to the full concatenated sequence
-            q_full = mx.concatenate([q_hist, q_curr], axis=1).reshape(b, s, n, d)
-            k_full = mx.concatenate([k_hist, k_curr], axis=1).reshape(b, s, n, d)
-
-            # RoPE is precomputed for the full (history + current) sequence
+            # Apply RoPE to full (history + current) sequence
             if rope_cos_sin is not None:
                 cos_f, sin_f = rope_cos_sin
-                q_seq = q_full.reshape(b, s, n, d // 2, 2)
+                half_d = d // 2
+
+                q_seq = q.astype(mx.float32).reshape(b, s, n, half_d, 2)
                 q_real, q_imag = q_seq[..., 0], q_seq[..., 1]
-                q_out_r = q_real * cos_f - q_imag * sin_f
-                q_out_i = q_real * sin_f + q_imag * cos_f
-                q_full = mx.stack([q_out_r, q_out_i], axis=-1).reshape(b, s, n, d)
+                q = mx.stack([q_real * cos_f - q_imag * sin_f,
+                               q_real * sin_f + q_imag * cos_f], axis=-1).reshape(b, s, n, d)
 
-                k_seq = k_full.reshape(b, s, n, d // 2, 2)
+                k_seq = k.astype(mx.float32).reshape(b, s, n, half_d, 2)
                 k_real, k_imag = k_seq[..., 0], k_seq[..., 1]
-                k_out_r = k_real * cos_f - k_imag * sin_f
-                k_out_i = k_real * sin_f + k_imag * cos_f
-                k_full = mx.stack([k_out_r, k_out_i], axis=-1).reshape(b, s, n, d)
+                k = mx.stack([k_real * cos_f - k_imag * sin_f,
+                               k_real * sin_f + k_imag * cos_f], axis=-1).reshape(b, s, n, d)
 
-            q_hist = q_full[:, :history_seq_len].astype(w_dtype)
-            q_curr = q_full[:, history_seq_len:].astype(w_dtype)
-            k_hist = k_full[:, :history_seq_len].astype(w_dtype)
-            k_curr = k_full[:, history_seq_len:].astype(w_dtype)
-            v_hist_h = v_hist
-            v_curr_h = v_curr
+            # Split into history and current after RoPE
+            q_hist = q[:, :history_seq_len].astype(w_dtype)
+            q_curr = q[:, history_seq_len:].astype(w_dtype)
+            k_hist = k[:, :history_seq_len].astype(w_dtype)
+            k_curr = k[:, history_seq_len:].astype(w_dtype)
 
             # History self-attention: history attends to history only
             q_h = q_hist.transpose(0, 2, 1, 3)
             k_h = k_hist.transpose(0, 2, 1, 3)
-            v_h = v_hist_h.transpose(0, 2, 1, 3)
+            v_h = v_hist.transpose(0, 2, 1, 3)
             hist_out = mx.fast.scaled_dot_product_attention(
                 q_h, k_h, v_h, scale=self.scale
             )
@@ -167,7 +136,7 @@ class HeliosSelfAttention(nn.Module):
 
             # Current self-attention: current attends to history + current
             k_all = mx.concatenate([k_hist, k_curr], axis=1).transpose(0, 2, 1, 3)
-            v_all = mx.concatenate([v_hist_h, v_curr_h], axis=1).transpose(0, 2, 1, 3)
+            v_all = mx.concatenate([v_hist, v_curr], axis=1).transpose(0, 2, 1, 3)
             q_c = q_curr.transpose(0, 2, 1, 3)
             curr_out = mx.fast.scaled_dot_product_attention(
                 q_c, k_all, v_all, scale=self.scale

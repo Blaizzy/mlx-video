@@ -152,6 +152,7 @@ def generate_video(
     anti_drifting: bool = False,
     anti_drift_blend: float = 0.5,
     debug: bool = False,
+    no_compile: bool = False,
 ):
     """Generate video using Helios autoregressive pipeline with pyramid denoising.
 
@@ -172,6 +173,7 @@ def generate_video(
         crossfade_frames: Number of pixel frames to cross-fade between chunks (0 to disable)
         anti_drifting: Enable adaptive anti-drifting for temporal consistency
         anti_drift_blend: How much to normalize history toward EMA (0=off, 0.5=half, 1.0=full)
+        no_compile: If True, skip mx.compile on models (useful for debugging)
     """
     from mlx_video.models.helios.config import HeliosModelConfig
 
@@ -283,6 +285,10 @@ def generate_video(
         mx.eval(*[v for kv in negative_cross_kv_caches for v in kv])
 
     print(f"{Colors.DIM}  Text embedding + KV cache: ready{Colors.RESET}")
+
+    # Compile model for faster inference via kernel fusion
+    if not no_compile:
+        model._compiled = mx.compile(model)
 
     # 4. History setup (keep_first_frame=True matching reference)
     history_sizes = config.history_sizes  # [16, 2, 1]
@@ -428,11 +434,13 @@ def generate_video(
             cur_idx_mid = idx_mid
             cur_idx_long = idx_long
 
+            _call = getattr(model, '_compiled', model)
+
             for idx, t in enumerate(timesteps):
                 # Reference casts timestep to int64 before model call
                 timestep = mx.array(int(t.item()), dtype=mx.int32)
                 # Cast to bfloat16 to match reference (model trained with bf16 activations)
-                noise_pred = model(
+                noise_pred = _call(
                     latents=latents.astype(mx.bfloat16),
                     timestep=timestep,
                     encoder_hidden_states=context_embedded,
@@ -454,7 +462,7 @@ def generate_video(
                     print(f"    {_debug_stats('noise_pred', noise_pred)}")
 
                 if do_cfg:
-                    noise_uncond = model(
+                    noise_uncond = _call(
                         latents=latents.astype(mx.bfloat16),
                         timestep=timestep,
                         encoder_hidden_states=negative_context_embedded,
@@ -713,6 +721,7 @@ def main():
     parser.add_argument("--anti-drifting", action="store_true", help="Enable adaptive anti-drifting for temporal consistency between chunks")
     parser.add_argument("--anti-drift-blend", type=float, default=0.5, help="How much to normalize history toward EMA stats (0=off, 0.5=half, 1.0=full; default=0.5)")
     parser.add_argument("--debug", action="store_true", help="Print per-step latent statistics for debugging")
+    parser.add_argument("--no-compile", action="store_true", help="Disable mx.compile on models (for debugging)")
     args = parser.parse_args()
 
     generate_video(
@@ -733,6 +742,7 @@ def main():
         anti_drifting=args.anti_drifting,
         anti_drift_blend=args.anti_drift_blend,
         debug=args.debug,
+        no_compile=args.no_compile,
     )
 
 

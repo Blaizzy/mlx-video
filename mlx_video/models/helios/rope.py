@@ -90,19 +90,13 @@ def _rope_pad_and_downsample(rope_5d: mx.array, kernel: tuple) -> mx.array:
     pad_t = (kt - (f % kt)) % kt
     pad_h = (kh - (h % kh)) % kh
     pad_w = (kw - (w % kw)) % kw
-    if pad_t > 0:
-        rope_5d = mx.concatenate(
-            [rope_5d, mx.repeat(rope_5d[-1:], pad_t, axis=0)], axis=0
+    if pad_t > 0 or pad_h > 0 or pad_w > 0:
+        rope_5d = mx.pad(
+            rope_5d,
+            [(0, pad_t), (0, pad_h), (0, pad_w), (0, 0), (0, 0)],
+            mode="edge",
         )
-    if pad_h > 0:
-        rope_5d = mx.concatenate(
-            [rope_5d, mx.repeat(rope_5d[:, -1:], pad_h, axis=1)], axis=1
-        )
-    if pad_w > 0:
-        rope_5d = mx.concatenate(
-            [rope_5d, mx.repeat(rope_5d[:, :, -1:], pad_w, axis=2)], axis=2
-        )
-    f, h, w = rope_5d.shape[:3]
+        f, h, w = rope_5d.shape[:3]
 
     # Reshape and average (avg_pool3d equivalent)
     rope_5d = rope_5d.reshape(f // kt, kt, h // kh, kh, w // kw, kw, d, c)
