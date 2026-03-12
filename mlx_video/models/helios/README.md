@@ -9,25 +9,27 @@ Helios is a 14B-parameter autoregressive video generation model that produces mi
 Download the HuggingFace checkpoint and convert to MLX format:
 
 ```bash
-python -m mlx_video.convert_helios convert \
-    /path/to/BestWishYsh/Helios-Distilled \
-    ./helios-mlx
+python -m mlx_video.convert_helios \
+    --checkpoint-dir /path/to/BestWishYsh/Helios-Distilled \
+    --output-dir ./helios-mlx
 ```
 
 With 4-bit quantization (~7 GB, fits 16 GB Macs):
 
 ```bash
-python -m mlx_video.convert_helios convert \
-    /path/to/BestWishYsh/Helios-Distilled \
-    ./helios-mlx-4bit \
+python -m mlx_video.convert_helios \
+    --checkpoint-dir /path/to/BestWishYsh/Helios-Distilled \
+    --output-dir ./helios-mlx-4bit \
     --quantize --bits 4
 ```
 
-Or quantize an existing MLX model:
+Or quantize an existing MLX model (skips HF conversion):
 
 ```bash
-python -m mlx_video.convert_helios quantize ./helios-mlx --bits 4
-# Creates ./helios-mlx-4bit/
+python -m mlx_video.convert_helios \
+    --checkpoint-dir ./helios-mlx \
+    --output-dir ./helios-mlx-4bit \
+    --quantize-only --bits 4
 ```
 
 ### 2. Generate Video
