@@ -2,6 +2,10 @@
 
 Helios is a 14B-parameter autoregressive video generation model that produces minute-scale, temporally coherent video. This implementation targets the **Helios-Distilled** variant for text-to-video generation on Apple Silicon via MLX.
 
+- Arxiv: https://arxiv.org/abs/2603.04379
+- https://pku-yuangroup.github.io/Helios-Page/
+- https://github.com/PKU-YuanGroup/Helios
+
 ### Step 1: Download Weights
 
 Download the original PyTorch checkpoint from HuggingFace using the `huggingface-cli` tool (install with `pip install huggingface_hub`):
