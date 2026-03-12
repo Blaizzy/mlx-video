@@ -586,21 +586,73 @@ def _quantize_saved_model(
 
 if __name__ == "__main__":
     import argparse
+    import shutil
 
     parser = argparse.ArgumentParser(description="Convert Helios weights to MLX format")
-    parser.add_argument("checkpoint_dir", type=str, help="Path to HF Helios checkpoint")
-    parser.add_argument("output_dir", type=str, help="Output MLX model directory")
-    parser.add_argument("--dtype", type=str, default="bfloat16", choices=["float16", "float32", "bfloat16"])
-    parser.add_argument("--quantize", action="store_true", help="Quantize transformer weights")
-    parser.add_argument("--bits", type=int, default=4, help="Quantization bits")
-    parser.add_argument("--group-size", type=int, default=64, help="Quantization group size")
+    subparsers = parser.add_subparsers(dest="command")
+
+    # Original conversion command (default when no subcommand)
+    convert_parser = subparsers.add_parser("convert", help="Convert HF checkpoint to MLX format")
+    convert_parser.add_argument("checkpoint_dir", type=str, help="Path to HF Helios checkpoint")
+    convert_parser.add_argument("output_dir", type=str, help="Output MLX model directory")
+    convert_parser.add_argument("--dtype", type=str, default="bfloat16", choices=["float16", "float32", "bfloat16"])
+    convert_parser.add_argument("--quantize", action="store_true", help="Quantize transformer weights")
+    convert_parser.add_argument("--bits", type=int, default=4, help="Quantization bits")
+    convert_parser.add_argument("--group-size", type=int, default=64, help="Quantization group size")
+
+    # Quantize-only command for existing MLX models
+    quant_parser = subparsers.add_parser("quantize", help="Quantize an existing MLX model")
+    quant_parser.add_argument("model_dir", type=str, help="Path to existing MLX model directory")
+    quant_parser.add_argument("--output-dir", type=str, default=None,
+                              help="Output directory (default: <model_dir>-<bits>bit)")
+    quant_parser.add_argument("--bits", type=int, default=4, help="Quantization bits (default: 4)")
+    quant_parser.add_argument("--group-size", type=int, default=64, help="Quantization group size")
+
     args = parser.parse_args()
 
-    convert_helios_checkpoint(
-        args.checkpoint_dir,
-        args.output_dir,
-        dtype=args.dtype,
-        quantize=args.quantize,
-        bits=args.bits,
-        group_size=args.group_size,
-    )
+    # Backward compatibility: if no subcommand, treat positional args as convert
+    if args.command is None:
+        # Legacy mode: positional args
+        parser.print_help()
+        print("\nUse 'convert' or 'quantize' subcommand. Examples:")
+        print("  python -m mlx_video.convert_helios convert <hf_dir> <output_dir> [--quantize]")
+        print("  python -m mlx_video.convert_helios quantize <mlx_model_dir> [--bits 4]")
+        raise SystemExit(1)
+
+    if args.command == "convert":
+        convert_helios_checkpoint(
+            args.checkpoint_dir,
+            args.output_dir,
+            dtype=args.dtype,
+            quantize=args.quantize,
+            bits=args.bits,
+            group_size=args.group_size,
+        )
+    elif args.command == "quantize":
+        from mlx_video.models.helios.config import HeliosModelConfig
+
+        model_dir = Path(args.model_dir)
+        output_dir = Path(args.output_dir) if args.output_dir else model_dir.parent / f"{model_dir.name}-{args.bits}bit"
+
+        # Load config
+        config_path = model_dir / "config.json"
+        if not config_path.exists():
+            raise FileNotFoundError(f"No config.json found in {model_dir}")
+        with open(config_path) as f:
+            config_dict = json.load(f)
+        if "quantization" in config_dict:
+            raise ValueError(f"Model is already quantized: {config_dict['quantization']}")
+
+        config = HeliosModelConfig(**{
+            k: v for k, v in config_dict.items()
+            if k in HeliosModelConfig.__dataclass_fields__
+        })
+
+        # Copy to output dir if different
+        if output_dir != model_dir:
+            print(f"Copying {model_dir} → {output_dir}")
+            shutil.copytree(model_dir, output_dir, dirs_exist_ok=True)
+
+        print(f"Quantizing to {args.bits}-bit (group_size={args.group_size})...")
+        _quantize_saved_model(output_dir, config, bits=args.bits, group_size=args.group_size)
+        print(f"\nDone! Quantized model saved to: {output_dir}")
