@@ -96,13 +96,13 @@ class HeliosTransformerBlock(nn.Module):
         # timestep_proj: [B, L, 6, dim] (per-token) or [B, 6, dim] (global)
         if timestep_proj.ndim == 4:
             # [B, L, 6, dim] + [1, 1, 6, dim] → [B, L, 6, dim]
-            mod = (self.scale_shift_table[None, :, :] + timestep_proj.astype(mx.float32))
-            shift_msa = mod[:, :, 0].astype(w_dtype)
-            scale_msa = mod[:, :, 1].astype(w_dtype)
-            gate_msa = mod[:, :, 2].astype(w_dtype)
-            c_shift = mod[:, :, 3].astype(w_dtype)
-            c_scale = mod[:, :, 4].astype(w_dtype)
-            c_gate = mod[:, :, 5].astype(w_dtype)
+            mod = (self.scale_shift_table[None, :, :] + timestep_proj.astype(mx.float32)).astype(w_dtype)
+            shift_msa = mod[:, :, 0]
+            scale_msa = mod[:, :, 1]
+            gate_msa = mod[:, :, 2]
+            c_shift = mod[:, :, 3]
+            c_scale = mod[:, :, 4]
+            c_gate = mod[:, :, 5]
         else:
             # [B, 6, dim] + [1, 6, dim] → [B, 6, dim]
             mod = (self.scale_shift_table + timestep_proj.astype(mx.float32)).astype(w_dtype)

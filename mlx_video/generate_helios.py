@@ -438,10 +438,12 @@ def generate_video(
 
             _call = getattr(model, '_compiled', model)
 
-            for idx, t in enumerate(timesteps):
-                # Reference casts timestep to int64 before model call
-                timestep = mx.array(int(t.item()), dtype=mx.int32)
-                # Cast to bfloat16 to match reference (model trained with bf16 activations)
+            # Pre-convert to Python lists to avoid .item()/.float() sync points
+            timestep_list = [int(t) for t in timesteps.tolist()]
+            sigma_list = scheduler.sigmas.tolist()
+
+            for idx, t_val in enumerate(timestep_list):
+                timestep = mx.array(t_val, dtype=mx.int32)
                 noise_pred = _call(
                     latents=latents.astype(mx.bfloat16),
                     timestep=timestep,
@@ -455,11 +457,10 @@ def generate_video(
                     history_long_indices=cur_idx_long,
                     cross_kv_caches=cross_kv_caches,
                 )
-                mx.eval(noise_pred)
 
                 if debug:
-                    sigma_t = scheduler.sigmas[idx].item()
-                    print(f"\n  [Step {idx}] t={int(t.item())} sigma={sigma_t:.6f}")
+                    mx.eval(noise_pred)
+                    print(f"\n  [Step {idx}] t={t_val} sigma={sigma_list[idx]:.6f}")
                     print(f"    {_debug_stats('model_in', latents)}")
                     print(f"    {_debug_stats('noise_pred', noise_pred)}")
 
@@ -480,11 +481,14 @@ def generate_video(
                     mx.eval(noise_uncond)
                     noise_pred = noise_uncond + guidance_scale * (noise_pred - noise_uncond)
 
+                sigma_next = sigma_list[idx + 1] if idx < len(timestep_list) - 1 else None
                 latents = scheduler.step_dmd(
                     model_output=noise_pred,
                     sample=latents,
                     cur_step=idx,
                     noisy_start=start_point_list[i_s],
+                    sigma_t=sigma_list[idx],
+                    sigma_next=sigma_next,
                 )
                 mx.eval(latents)
 
