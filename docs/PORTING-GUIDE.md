@@ -847,7 +847,7 @@ python scripts/video/video_quality.py output.mp4 --chunk-size 32
 python scripts/video/compare_videos.py reference.mp4 output.mp4 --diff-video diff.mp4
 ```
 
-### Model-specific diagnostics (`scripts/helios/`)
+### Model-specific diagnostics (`mlx_video/models/helios/scripts/`)
 
 | Script | Purpose |
 |--------|---------|

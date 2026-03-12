@@ -24,7 +24,7 @@ Usage:
         --output-path /tmp/debug_test.mp4
 
     # Step 2: Compare with PyTorch
-    python scripts/helios/compare_models.py \
+    python mlx_video/models/helios/scripts/compare_models.py \
         --model-dir /path/to/Helios-Distilled \
         --prompt "A beautiful sunset over the ocean" \
         --inputs /tmp/helios_model_inputs.npz \

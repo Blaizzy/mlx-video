@@ -9,7 +9,7 @@ Requirements:
     pip install diffusers transformers torch accelerate
 
 Usage:
-    python scripts/helios/run_reference.py \
+    python mlx_video/models/helios/scripts/run_reference.py \
         --model-dir /path/to/Helios-Distilled \
         --prompt "A golden retriever running on a sunny beach" \
         --output /tmp/helios_ref.mp4
@@ -19,7 +19,7 @@ Usage:
         --model-dir /path/to/Helios-Distilled-MLX \
         --prompt "A golden retriever running on a sunny beach" \
         --output-path /tmp/helios_mlx.mp4
-    python scripts/helios/analyze_boundaries.py \
+    python mlx_video/models/helios/scripts/analyze_boundaries.py \
         /tmp/helios_ref.mp4 /tmp/helios_mlx.mp4
 """
 

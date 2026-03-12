@@ -15,11 +15,11 @@ Requirements:
     - PyTorch + diffusers
 
 Usage:
-    python scripts/helios/compare_pipelines.py \
+    python mlx_video/models/helios/scripts/compare_pipelines.py \
         --helios-dir /path/to/Helios
 
     # Custom parameters
-    python scripts/helios/compare_pipelines.py \
+    python mlx_video/models/helios/scripts/compare_pipelines.py \
         --helios-dir /path/to/Helios \
         --seed 123 --stages 3 --steps 2 2 2
 """

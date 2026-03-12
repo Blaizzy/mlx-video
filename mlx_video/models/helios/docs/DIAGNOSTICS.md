@@ -57,7 +57,7 @@ mlx_video/models/helios/
   loading.py       # Weight loading wrappers (51 lines)
 mlx_video/convert_helios.py           # HF→MLX weight conversion
 tests/test_helios.py                  # 46 tests (554 lines)
-scripts/helios/
+mlx_video/models/helios/scripts/
   analyze_boundaries.py  # Boundary quality analysis (compare videos)
   run_reference.py       # Run PyTorch reference pipeline on MPS
   compare_pipelines.py   # Compare scheduler/pipeline mechanics
@@ -354,7 +354,7 @@ spatial brightness redistribution (face darkens, background brightens).
    between chunks via downscale/diff/upscale additive correction (6-frame ramp)
 4. **Per-channel contrast correction** — scales std dev to match previous chunk's last frame
 
-**Results** (measured with `scripts/helios/analyze_boundaries.py`):
+**Results** (measured with `mlx_video/models/helios/scripts/analyze_boundaries.py`):
 | Metric | No fix | With all fixes |
 |--------|--------|----------------|
 | Contrast jump | -7.0% | **-1.0%** |
@@ -584,7 +584,7 @@ def _time_shift(mu, t):
 
 ### Diagnostic scripts
 
-Consolidated diagnostic scripts live in `scripts/helios/`:
+Consolidated diagnostic scripts live in `mlx_video/models/helios/scripts/`:
 
 | Script | Purpose |
 |--------|---------|
@@ -597,21 +597,21 @@ Consolidated diagnostic scripts live in `scripts/helios/`:
 
 ```bash
 # Single video
-python scripts/helios/analyze_boundaries.py /tmp/helios_output.mp4
+python mlx_video/models/helios/scripts/analyze_boundaries.py /tmp/helios_output.mp4
 
 # Compare before/after fix
-python scripts/helios/analyze_boundaries.py \
+python mlx_video/models/helios/scripts/analyze_boundaries.py \
     /tmp/before_fix.mp4 /tmp/after_fix.mp4
 
 # Reference pipeline uses 33 frames/chunk (no first-frame trim)
-python scripts/helios/analyze_boundaries.py --chunk-size 33 /tmp/ref.mp4
+python mlx_video/models/helios/scripts/analyze_boundaries.py --chunk-size 33 /tmp/ref.mp4
 ```
 
 **Run reference pipeline for comparison**:
 
 ```bash
 # Requires: pip install diffusers transformers torch accelerate
-python scripts/helios/run_reference.py \
+python mlx_video/models/helios/scripts/run_reference.py \
     --model-dir /path/to/Helios-Distilled \
     --prompt "A golden retriever running on a sunny beach" \
     --output /tmp/helios_ref.mp4
@@ -620,7 +620,7 @@ python scripts/helios/run_reference.py \
 **Compare pipeline mechanics** (no model weights needed):
 
 ```bash
-python scripts/helios/compare_pipelines.py \
+python mlx_video/models/helios/scripts/compare_pipelines.py \
     --helios-dir /path/to/Helios
 ```
 
