@@ -62,10 +62,20 @@ python -m mlx_video.generate_helios \
 ```bash
 python -m mlx_video.generate_helios \
     --model-dir ./Helios-Distilled-MLX \
-    --num-frames 330 \
+    --num-frames 999 \
     --seed 2391784614 \
     --prompt "Two dogs of the poodle breed sitting on a beach wearing sunglasses, nodding with their heads, close up, cinematic, sunset"
 ```
+
+### Enjoy the poodles
+
+![Poodles](../../../examples/poodles_helios.gif)
+
+Gif downsampled for file size resasons:
+```bash
+ffmpeg -i poodles_helios.mp4 -vf "fps=10,scale=480:-1:flags=lanczos,palettegen=max_colors=32" poodles_helios_palette.png  
+ffmpeg -i poodles_helios.mp4 -i poodles_helios_palette.png -filter_complex "fps=6,scale=260:-1:flags=lanczos[x];[x][1:v]paletteuse=dither=bayer:bayer_scale=1" poodles_helios.gif
+````
 
 #### Generation Options
 
