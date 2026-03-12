@@ -225,22 +225,27 @@ class HeliosModel(nn.Module):
             10000.0, -mx.arange(half).astype(mx.float32) / half
         )
 
-        # Precompute constant t=0 timestep projection for history tokens
-        if config.zero_history_timestep:
-            self._t0_proj = self._compute_t0_projection()
+        # Will be computed lazily after weights are loaded
+        self._t0_proj: mx.array | None = None
 
-    def _compute_t0_projection(self) -> mx.array:
-        """Precompute the timestep projection for t=0 (used for history tokens)."""
-        t0_emb = mx.array([0.0]) * self._inv_freq
-        t0_emb = mx.concatenate([mx.cos(t0_emb), mx.sin(t0_emb)], axis=-1)[None, :]
-        temb_t0 = self.time_embedding_1(
-            self.time_embedding_act(self.time_embedding_0(t0_emb))
-        )
-        tp_t0 = self.time_projection(
-            self.time_projection_act(temb_t0)
-        ).reshape(1, 6, -1)
-        mx.eval(tp_t0)
-        return tp_t0
+    def _get_t0_projection(self) -> mx.array:
+        """Get the cached t=0 timestep projection, computing on first use.
+
+        Must be called after weights are loaded (not in __init__) so that
+        the time_embedding and time_projection layers use trained weights.
+        """
+        if self._t0_proj is None:
+            t0_emb = mx.array([0.0]) * self._inv_freq
+            t0_emb = mx.concatenate([mx.cos(t0_emb), mx.sin(t0_emb)], axis=-1)[None, :]
+            temb_t0 = self.time_embedding_1(
+                self.time_embedding_act(self.time_embedding_0(t0_emb))
+            )
+            tp_t0 = self.time_projection(
+                self.time_projection_act(temb_t0)
+            ).reshape(1, 6, -1)
+            mx.eval(tp_t0)
+            self._t0_proj = tp_t0
+        return self._t0_proj
 
     def _patchify(self, x: mx.array) -> tuple:
         """Convert video latent to patch embeddings.
@@ -474,7 +479,7 @@ class HeliosModel(nn.Module):
         # Zero history timestep embedding (use precomputed t=0 projection)
         if self.zero_history_timestep and history_seq_len > 0:
             tp_t0_expanded = mx.broadcast_to(
-                self._t0_proj[:, :, None, :],
+                self._get_t0_projection()[:, :, None, :],
                 (1, 6, history_seq_len, self.dim),
             )
             timestep_proj_expanded = mx.concatenate(
