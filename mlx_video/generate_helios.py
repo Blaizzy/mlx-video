@@ -442,6 +442,11 @@ def generate_video(
             timestep_list = [int(t) for t in timesteps.tolist()]
             sigma_list = scheduler.sigmas.tolist()
 
+            # History doesn't change within a stage — cast once outside the loop
+            h_short_bf16 = h_short.astype(mx.bfloat16)
+            h_mid_bf16 = h_mid.astype(mx.bfloat16)
+            h_long_bf16 = h_long.astype(mx.bfloat16)
+
             for idx, t_val in enumerate(timestep_list):
                 timestep = mx.array(t_val, dtype=mx.int32)
                 noise_pred = _call(
@@ -449,9 +454,9 @@ def generate_video(
                     timestep=timestep,
                     encoder_hidden_states=context_embedded,
                     frame_indices=cur_idx,
-                    history_short=h_short.astype(mx.bfloat16),
-                    history_mid=h_mid.astype(mx.bfloat16),
-                    history_long=h_long.astype(mx.bfloat16),
+                    history_short=h_short_bf16,
+                    history_mid=h_mid_bf16,
+                    history_long=h_long_bf16,
                     history_short_indices=cur_idx_short,
                     history_mid_indices=cur_idx_mid,
                     history_long_indices=cur_idx_long,
@@ -470,9 +475,9 @@ def generate_video(
                         timestep=timestep,
                         encoder_hidden_states=negative_context_embedded,
                         frame_indices=cur_idx,
-                        history_short=h_short.astype(mx.bfloat16),
-                        history_mid=h_mid.astype(mx.bfloat16),
-                        history_long=h_long.astype(mx.bfloat16),
+                        history_short=h_short_bf16,
+                        history_mid=h_mid_bf16,
+                        history_long=h_long_bf16,
                         history_short_indices=cur_idx_short,
                         history_mid_indices=cur_idx_mid,
                         history_long_indices=cur_idx_long,
