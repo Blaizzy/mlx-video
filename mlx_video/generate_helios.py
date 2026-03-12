@@ -368,8 +368,10 @@ def generate_video(
             print(f"\n[DEBUG] Chunk {chunk_idx}: initial noise → 1/4 res")
             print(f"  {_debug_stats('start_point[0]', latents)}")
 
+        is_amplified = amplify_first_chunk and is_first
+        total_steps = sum(s * 2 if is_amplified else s for s in pyramid_steps)
         pbar = tqdm(
-            total=sum(pyramid_steps),
+            total=total_steps,
             desc=f"  Chunk {chunk_idx + 1}/{num_chunks}",
             leave=True,
             bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
