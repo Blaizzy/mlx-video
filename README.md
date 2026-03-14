@@ -16,6 +16,20 @@ pip install git+https://github.com/Blaizzy/mlx-video.git
 uv pip install git+https://github.com/Blaizzy/mlx-video.git
 ```
 
+## Model Downloads
+
+Use the repo script to prefetch weights into the Hugging Face cache (so `snapshot_download` can find them locally):
+
+```bash
+./download.sh
+```
+
+You can also set a custom cache location:
+
+```bash
+./download.sh --hf-home /path/to/hf-cache
+```
+
 Supported models:
 
 - [**LTX-2**](https://huggingface.co/Lightricks/LTX-Video) — 19B parameter video generation model from Lightricks
