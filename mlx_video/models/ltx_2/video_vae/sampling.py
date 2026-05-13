@@ -90,10 +90,15 @@ class SpaceToDepthDownsample(nn.Module):
 
         # Skip connection: space-to-depth on input, then group mean
         x_in = self._space_to_depth(x)
-        # Reshape for group mean: (b, c*prod(stride), d, h, w) -> (b, out_channels, group_size, d, h, w)
+        # Derive actual out_channels from the conv weight to handle config/weight mismatches
+        # (e.g. LTX-2.3 weights have different channel counts than the config implies)
+        st, sh, sw = self.stride
+        actual_conv_out = self.conv.conv.weight.shape[0]
+        actual_out_channels = actual_conv_out * st * sh * sw
         b2, c2, d2, h2, w2 = x_in.shape
-        x_in = mx.reshape(x_in, (b2, self.out_channels, self.group_size, d2, h2, w2))
-        x_in = mx.mean(x_in, axis=2)  # (b, out_channels, d, h, w)
+        actual_group_size = c2 // actual_out_channels
+        x_in = mx.reshape(x_in, (b2, actual_out_channels, actual_group_size, d2, h2, w2))
+        x_in = mx.mean(x_in, axis=2)  # (b, actual_out_channels, d, h, w)
 
         # Conv branch: apply conv then space-to-depth
         x_conv = self.conv(x, causal=causal)
