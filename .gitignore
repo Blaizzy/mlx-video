@@ -8,3 +8,4 @@ config.json
 **.pyc
 __pycache__/*
 *.egg-info/*
+outputs/

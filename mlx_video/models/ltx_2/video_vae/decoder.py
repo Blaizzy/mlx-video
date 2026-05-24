@@ -365,23 +365,61 @@ class LTX2VideoDecoder(nn.Module):
         sanitized = {}
         if "per_channel_statistics.mean" in weights:
             return weights
+        saw_decoder_weights = False
         for key, value in weights.items():
             new_key = key
 
-            if not key.startswith("vae.") or key.startswith("vae.encoder."):
+            # Converted checkpoints use vae.decoder.*, while Hugging Face
+            # unified VAE files use decoder.*.
+            if key.startswith(("vae.encoder.", "encoder.")):
+                continue
+            if not (
+                key.startswith("vae.")
+                or key.startswith("decoder.")
+                or key.startswith("per_channel_statistics.")
+            ):
                 continue
 
-            if key.startswith("vae.per_channel_statistics."):
+            if key.startswith(("vae.per_channel_statistics.", "per_channel_statistics.")):
                 # Map per-channel statistics (use exact key matching)
-                if key == "vae.per_channel_statistics.mean-of-means":
+                if key in {
+                    "vae.per_channel_statistics.mean-of-means",
+                    "per_channel_statistics.mean-of-means",
+                }:
                     new_key = "per_channel_statistics.mean"
-                elif key == "vae.per_channel_statistics.std-of-means":
+                elif key in {
+                    "vae.per_channel_statistics.std-of-means",
+                    "per_channel_statistics.std-of-means",
+                }:
                     new_key = "per_channel_statistics.std"
                 else:
                     continue  # Skip other statistics keys
 
             if key.startswith("vae.decoder."):
                 new_key = key.replace("vae.decoder.", "")
+                saw_decoder_weights = True
+            elif key.startswith("decoder."):
+                new_key = key.replace("decoder.", "")
+                saw_decoder_weights = True
+
+            parts = new_key.split(".")
+            if (
+                len(parts) >= 3
+                and parts[0] == "mid_block"
+                and parts[1] == "resnets"
+            ):
+                new_key = ".".join(["up_blocks", "0", "res_blocks"] + parts[2:])
+            elif len(parts) >= 4 and parts[0] == "up_blocks" and parts[1].isdigit():
+                block_idx = int(parts[1])
+                if parts[2] == "resnets":
+                    new_key = ".".join(
+                        ["up_blocks", str(block_idx * 2 + 2), "res_blocks"]
+                        + parts[3:]
+                    )
+                elif parts[2] == "upsamplers" and parts[3] == "0":
+                    new_key = ".".join(
+                        ["up_blocks", str(block_idx * 2 + 1)] + parts[4:]
+                    )
 
             # Handle Conv3d weight transpose: (O, I, D, H, W) -> (O, D, H, W, I)
             if ".conv.weight" in key and value.ndim == 5:
@@ -400,6 +438,13 @@ class LTX2VideoDecoder(nn.Module):
                     new_key = new_key.replace(".conv.bias", ".conv.conv.bias")
 
             sanitized[new_key] = value
+        if (
+            saw_decoder_weights
+            and "per_channel_statistics.mean" not in sanitized
+            and "per_channel_statistics.std" not in sanitized
+        ):
+            sanitized["per_channel_statistics.mean"] = self.per_channel_statistics.mean
+            sanitized["per_channel_statistics.std"] = self.per_channel_statistics.std
         return sanitized
 
     @classmethod
@@ -420,6 +465,16 @@ class LTX2VideoDecoder(nn.Module):
 
         model_path = Path(model_path)
         config_dict = {}
+        weight_files = sorted(model_path.glob("*.safetensors"))
+        if (
+            not weight_files
+            and model_path.name == "decoder"
+            and model_path.parent.exists()
+        ):
+            parent_weight_files = sorted(model_path.parent.glob("*.safetensors"))
+            if parent_weight_files:
+                model_path = model_path.parent
+                weight_files = parent_weight_files
 
         # Load config from directory
         config_path = model_path / "config.json"
@@ -428,7 +483,6 @@ class LTX2VideoDecoder(nn.Module):
                 config_dict = json.load(f)
 
         # Load weights from directory
-        weight_files = sorted(model_path.glob("*.safetensors"))
         if not weight_files:
             raise FileNotFoundError(f"No safetensors files found in {model_path}")
         weights = {}
@@ -439,7 +493,10 @@ class LTX2VideoDecoder(nn.Module):
         decoder_blocks = cls._infer_blocks(weights)
 
         # Determine spatial padding mode from config
-        spatial_padding_mode_str = config_dict.get("spatial_padding_mode", "reflect")
+        spatial_padding_mode_str = config_dict.get(
+            "spatial_padding_mode",
+            config_dict.get("decoder_spatial_padding_mode", "reflect"),
+        )
         spatial_padding_mode = PaddingModeType(spatial_padding_mode_str)
 
         model = cls(

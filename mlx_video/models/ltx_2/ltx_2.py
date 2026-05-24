@@ -632,32 +632,70 @@ class LTXModel(nn.Module):
         sanitized = {}
 
         has_raw_prefix = any(k.startswith("model.diffusion_model.") for k in weights)
-        if not has_raw_prefix:
-            return weights
+        key_replacements = [
+            (".to_out.0", ".to_out"),
+            (".ff.net.0.proj", ".ff.proj_in"),
+            (".ff.net.2", ".ff.proj_out"),
+            (".audio_ff.net.0.proj", ".audio_ff.proj_in"),
+            (".audio_ff.net.2", ".audio_ff.proj_out"),
+            (".linear_1", ".linear1"),
+            (".linear_2", ".linear2"),
+            (".norm_q", ".q_norm"),
+            (".norm_k", ".k_norm"),
+        ]
+        prefix_replacements = [
+            ("audio_proj_in.", "audio_patchify_proj."),
+            ("proj_in.", "patchify_proj."),
+            ("audio_time_embed.", "audio_adaln_single."),
+            ("time_embed.", "adaln_single."),
+            (
+                "av_cross_attn_video_scale_shift.",
+                "av_ca_video_scale_shift_adaln_single.",
+            ),
+            (
+                "av_cross_attn_audio_scale_shift.",
+                "av_ca_audio_scale_shift_adaln_single.",
+            ),
+            ("av_cross_attn_video_a2v_gate.", "av_ca_a2v_gate_adaln_single."),
+            ("av_cross_attn_audio_v2a_gate.", "av_ca_v2a_gate_adaln_single."),
+        ]
+        exact_replacements = [
+            (
+                ".video_a2v_cross_attn_scale_shift_table",
+                ".scale_shift_table_a2v_ca_video",
+            ),
+            (
+                ".audio_a2v_cross_attn_scale_shift_table",
+                ".scale_shift_table_a2v_ca_audio",
+            ),
+        ]
 
         for key, value in weights.items():
             new_key = key
 
-            if not key.startswith("model.diffusion_model."):
-                continue
-            if (
-                "audio_embeddings_connector" in key
-                or "video_embeddings_connector" in key
-            ):
-                continue
+            if has_raw_prefix:
+                if not key.startswith("model.diffusion_model."):
+                    continue
+                if (
+                    "audio_embeddings_connector" in key
+                    or "video_embeddings_connector" in key
+                ):
+                    continue
 
-            # Remove 'model.diffusion_model.' prefix
-            new_key = new_key.replace("model.diffusion_model.", "")
+                # Remove 'model.diffusion_model.' prefix
+                new_key = new_key.replace("model.diffusion_model.", "")
 
-            new_key = new_key.replace(".to_out.0.", ".to_out.")
-
-            new_key = new_key.replace(".ff.net.0.proj.", ".ff.proj_in.")
-            new_key = new_key.replace(".ff.net.2.", ".ff.proj_out.")
-            new_key = new_key.replace(".audio_ff.net.0.proj.", ".audio_ff.proj_in.")
-            new_key = new_key.replace(".audio_ff.net.2.", ".audio_ff.proj_out.")
-
-            new_key = new_key.replace(".linear_1.", ".linear1.")
-            new_key = new_key.replace(".linear_2.", ".linear2.")
+            for old, new in key_replacements:
+                if new_key.endswith(old):
+                    new_key = new_key[: -len(old)] + new
+                else:
+                    new_key = new_key.replace(old + ".", new + ".")
+            for old, new in prefix_replacements:
+                if new_key.startswith(old):
+                    new_key = new + new_key[len(old) :]
+                    break
+            for old, new in exact_replacements:
+                new_key = new_key.replace(old, new)
 
             sanitized[new_key] = value
 
@@ -670,7 +708,7 @@ class LTXModel(nn.Module):
         config_dict = {}
         with open(model_path / "config.json", "r") as f:
             config_dict = json.load(f)
-        config = LTXModelConfig(**config_dict)
+        config = LTXModelConfig.from_dict(config_dict)
         model = cls(config)
 
         weights = {}

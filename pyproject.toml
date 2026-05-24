@@ -25,6 +25,7 @@ dependencies = [
     "imageio>=2.37.2",
     "imageio-ffmpeg>=0.6.0",
     "ftfy",
+    "gradio>=6.0.0",
 ]
 license = {text="MIT"}
 authors = [
@@ -48,6 +49,7 @@ Issues = "https://github.com/Blaizzy/mlx-video/issues"
 [project.scripts]
 "mlx_video.ltx_2.generate" = "mlx_video.models.ltx_2.generate:main"
 "mlx_video.wan_2.generate" = "mlx_video.models.wan_2.generate:main"
+"mlx_video.webui" = "mlx_video.webui.app:main"
 
 [tool.setuptools.packages.find]
 include = ["mlx_video*"]
@@ -59,4 +61,3 @@ version = {attr = "mlx_video.version.__version__"}
 dev = [
     "pytest",
 ]
-
