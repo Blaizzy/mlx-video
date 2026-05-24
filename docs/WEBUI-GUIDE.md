@@ -98,3 +98,11 @@ TypeError: LTXModelConfig.__init__() got an unexpected keyword argument '_class_
 ```
 
 the local fix is to load LTX config through `LTXModelConfig.from_dict()`, which ignores Hugging Face metadata keys that are not dataclass fields.
+
+If the next failure is:
+
+```text
+ValueError: Received 1680 parameters not in model
+```
+
+the transformer checkpoint keys are still in Diffusers naming form. The local fix is to run unprefixed Hugging Face transformer weights through the same key sanitizer used for raw prefixed checkpoints. The sanitizer normalizes names such as `linear_1` to `linear1`, `to_out.0` to `to_out`, `norm_q` to `q_norm`, and maps top-level Diffusers modules like `time_embed` and `proj_in` to the local MLX module names.
