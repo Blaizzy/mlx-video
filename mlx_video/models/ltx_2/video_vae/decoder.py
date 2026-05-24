@@ -368,20 +368,55 @@ class LTX2VideoDecoder(nn.Module):
         for key, value in weights.items():
             new_key = key
 
-            if not key.startswith("vae.") or key.startswith("vae.encoder."):
+            # Converted checkpoints use vae.decoder.*, while Hugging Face
+            # unified VAE files use decoder.*.
+            if key.startswith(("vae.encoder.", "encoder.")):
+                continue
+            if not (
+                key.startswith("vae.")
+                or key.startswith("decoder.")
+                or key.startswith("per_channel_statistics.")
+            ):
                 continue
 
-            if key.startswith("vae.per_channel_statistics."):
+            if key.startswith(("vae.per_channel_statistics.", "per_channel_statistics.")):
                 # Map per-channel statistics (use exact key matching)
-                if key == "vae.per_channel_statistics.mean-of-means":
+                if key in {
+                    "vae.per_channel_statistics.mean-of-means",
+                    "per_channel_statistics.mean-of-means",
+                }:
                     new_key = "per_channel_statistics.mean"
-                elif key == "vae.per_channel_statistics.std-of-means":
+                elif key in {
+                    "vae.per_channel_statistics.std-of-means",
+                    "per_channel_statistics.std-of-means",
+                }:
                     new_key = "per_channel_statistics.std"
                 else:
                     continue  # Skip other statistics keys
 
             if key.startswith("vae.decoder."):
                 new_key = key.replace("vae.decoder.", "")
+            elif key.startswith("decoder."):
+                new_key = key.replace("decoder.", "")
+
+            parts = new_key.split(".")
+            if (
+                len(parts) >= 3
+                and parts[0] == "mid_block"
+                and parts[1] == "resnets"
+            ):
+                new_key = ".".join(["up_blocks", "0", "res_blocks"] + parts[2:])
+            elif len(parts) >= 4 and parts[0] == "up_blocks" and parts[1].isdigit():
+                block_idx = int(parts[1])
+                if parts[2] == "resnets":
+                    new_key = ".".join(
+                        ["up_blocks", str(block_idx * 2 + 2), "res_blocks"]
+                        + parts[3:]
+                    )
+                elif parts[2] == "upsamplers" and parts[3] == "0":
+                    new_key = ".".join(
+                        ["up_blocks", str(block_idx * 2 + 1)] + parts[4:]
+                    )
 
             # Handle Conv3d weight transpose: (O, I, D, H, W) -> (O, D, H, W, I)
             if ".conv.weight" in key and value.ndim == 5:

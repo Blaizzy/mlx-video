@@ -385,8 +385,9 @@ class VideoEncoder(nn.Module):
             if "position_ids" in key:
                 continue
 
-            # Only process VAE encoder weights
-            if not key.startswith("vae."):
+            # Only process VAE encoder weights.  Converted checkpoints use
+            # vae.encoder.*, while Hugging Face unified VAE files use encoder.*.
+            if not (key.startswith("vae.") or key.startswith("encoder.")):
                 continue
 
             # Handle per-channel statistics
@@ -399,8 +400,29 @@ class VideoEncoder(nn.Module):
                     continue
             elif key.startswith("vae.encoder."):
                 new_key = key.replace("vae.encoder.", "")
+            elif key.startswith("encoder."):
+                new_key = key.replace("encoder.", "")
             else:
                 continue
+
+            parts = new_key.split(".")
+            if len(parts) >= 4 and parts[0] == "down_blocks" and parts[1].isdigit():
+                block_idx = int(parts[1])
+                if parts[2] == "resnets":
+                    new_key = ".".join(
+                        ["down_blocks", str(block_idx * 2), "res_blocks"]
+                        + parts[3:]
+                    )
+                elif parts[2] == "downsamplers" and parts[3] == "0":
+                    new_key = ".".join(
+                        ["down_blocks", str(block_idx * 2 + 1)] + parts[4:]
+                    )
+            elif (
+                len(parts) >= 3
+                and parts[0] == "mid_block"
+                and parts[1] == "resnets"
+            ):
+                new_key = ".".join(["down_blocks", "8", "res_blocks"] + parts[2:])
 
             # Conv3d: PyTorch (O, I, D, H, W) -> MLX (O, D, H, W, I)
             if "conv" in new_key.lower() and "weight" in new_key and value.ndim == 5:

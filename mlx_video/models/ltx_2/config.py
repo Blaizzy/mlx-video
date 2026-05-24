@@ -365,6 +365,13 @@ class VideoEncoderModelConfig(BaseModelConfig):
         ]
     )
 
+    @classmethod
+    def from_dict(cls, params: dict[str, Any]) -> "VideoEncoderModelConfig":
+        params = dict(params)
+        if "latent_channels" in params:
+            params["out_channels"] = params["latent_channels"]
+        return super().from_dict(params)
+
     def __post_init__(self):
         from mlx_video.models.ltx_2.video_vae.convolution import PaddingModeType
         from mlx_video.models.ltx_2.video_vae.resnet import NormLayerType

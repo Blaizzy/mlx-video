@@ -78,3 +78,69 @@ def test_video_decoder_falls_back_to_unified_vae_parent(tmp_path, monkeypatch):
 
     assert captured["loaded_path"] == str(vae_dir / "diffusion_pytorch_model.safetensors")
     assert captured["kwargs"]["spatial_padding_mode"].value == "reflect"
+
+
+def test_video_encoder_sanitize_accepts_unprefixed_unified_vae_keys():
+    from mlx_video.models.ltx_2.config import VideoEncoderModelConfig
+    from mlx_video.models.ltx_2.video_vae.video_vae import VideoEncoder
+
+    encoder = VideoEncoder(VideoEncoderModelConfig())
+
+    sanitized = encoder.sanitize(
+        {
+            "encoder.conv_in.conv.bias": "conv-bias",
+            "encoder.down_blocks.0.resnets.0.conv1.conv.bias": "resnet-bias",
+            "encoder.down_blocks.0.downsamplers.0.conv.conv.bias": "downsample-bias",
+            "encoder.mid_block.resnets.1.conv2.conv.bias": "mid-bias",
+            "decoder.conv_in.conv.bias": "decoder-bias",
+        }
+    )
+
+    assert sanitized == {
+        "conv_in.conv.bias": "conv-bias",
+        "down_blocks.0.res_blocks.0.conv1.conv.bias": "resnet-bias",
+        "down_blocks.1.conv.conv.bias": "downsample-bias",
+        "down_blocks.8.res_blocks.1.conv2.conv.bias": "mid-bias",
+    }
+
+
+def test_video_encoder_config_uses_diffusers_latent_channels():
+    from mlx_video.models.ltx_2.config import VideoEncoderModelConfig
+
+    config = VideoEncoderModelConfig.from_dict(
+        {
+            "_class_name": "AutoencoderKLLTX2Video",
+            "in_channels": 3,
+            "out_channels": 3,
+            "latent_channels": 128,
+            "patch_size": 4,
+            "encoder_spatial_padding_mode": "zeros",
+        }
+    )
+
+    assert config.out_channels == 128
+
+
+def test_video_decoder_sanitize_accepts_unprefixed_unified_vae_keys():
+    from mlx_video.models.ltx_2.video_vae.decoder import LTX2VideoDecoder
+
+    decoder = LTX2VideoDecoder(decoder_blocks=[])
+
+    sanitized = decoder.sanitize(
+        {
+            "encoder.conv_in.conv.bias": "encoder-bias",
+            "decoder.conv_in.conv.bias": "conv-bias",
+            "decoder.up_blocks.0.resnets.0.conv1.conv.bias": "resnet-bias",
+            "decoder.mid_block.resnets.0.conv1.conv.bias": "mid-bias",
+            "decoder.up_blocks.0.upsamplers.0.conv.conv.bias": "upsample-bias",
+            "per_channel_statistics.mean-of-means": "mean",
+        }
+    )
+
+    assert sanitized == {
+        "conv_in.conv.conv.bias": "conv-bias",
+        "up_blocks.2.res_blocks.0.conv1.conv.conv.bias": "resnet-bias",
+        "up_blocks.0.res_blocks.0.conv1.conv.conv.bias": "mid-bias",
+        "up_blocks.1.conv.conv.bias": "upsample-bias",
+        "per_channel_statistics.mean": "mean",
+    }
