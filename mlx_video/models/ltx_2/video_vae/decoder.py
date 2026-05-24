@@ -420,6 +420,16 @@ class LTX2VideoDecoder(nn.Module):
 
         model_path = Path(model_path)
         config_dict = {}
+        weight_files = sorted(model_path.glob("*.safetensors"))
+        if (
+            not weight_files
+            and model_path.name == "decoder"
+            and model_path.parent.exists()
+        ):
+            parent_weight_files = sorted(model_path.parent.glob("*.safetensors"))
+            if parent_weight_files:
+                model_path = model_path.parent
+                weight_files = parent_weight_files
 
         # Load config from directory
         config_path = model_path / "config.json"
@@ -428,7 +438,6 @@ class LTX2VideoDecoder(nn.Module):
                 config_dict = json.load(f)
 
         # Load weights from directory
-        weight_files = sorted(model_path.glob("*.safetensors"))
         if not weight_files:
             raise FileNotFoundError(f"No safetensors files found in {model_path}")
         weights = {}
@@ -439,7 +448,10 @@ class LTX2VideoDecoder(nn.Module):
         decoder_blocks = cls._infer_blocks(weights)
 
         # Determine spatial padding mode from config
-        spatial_padding_mode_str = config_dict.get("spatial_padding_mode", "reflect")
+        spatial_padding_mode_str = config_dict.get(
+            "spatial_padding_mode",
+            config_dict.get("decoder_spatial_padding_mode", "reflect"),
+        )
         spatial_padding_mode = PaddingModeType(spatial_padding_mode_str)
 
         model = cls(
