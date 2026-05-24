@@ -365,6 +365,7 @@ class LTX2VideoDecoder(nn.Module):
         sanitized = {}
         if "per_channel_statistics.mean" in weights:
             return weights
+        saw_decoder_weights = False
         for key, value in weights.items():
             new_key = key
 
@@ -396,8 +397,10 @@ class LTX2VideoDecoder(nn.Module):
 
             if key.startswith("vae.decoder."):
                 new_key = key.replace("vae.decoder.", "")
+                saw_decoder_weights = True
             elif key.startswith("decoder."):
                 new_key = key.replace("decoder.", "")
+                saw_decoder_weights = True
 
             parts = new_key.split(".")
             if (
@@ -435,6 +438,13 @@ class LTX2VideoDecoder(nn.Module):
                     new_key = new_key.replace(".conv.bias", ".conv.conv.bias")
 
             sanitized[new_key] = value
+        if (
+            saw_decoder_weights
+            and "per_channel_statistics.mean" not in sanitized
+            and "per_channel_statistics.std" not in sanitized
+        ):
+            sanitized["per_channel_statistics.mean"] = self.per_channel_statistics.mean
+            sanitized["per_channel_statistics.std"] = self.per_channel_statistics.std
         return sanitized
 
     @classmethod

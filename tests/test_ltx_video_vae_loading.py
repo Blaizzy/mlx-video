@@ -144,3 +144,18 @@ def test_video_decoder_sanitize_accepts_unprefixed_unified_vae_keys():
         "up_blocks.1.conv.conv.bias": "upsample-bias",
         "per_channel_statistics.mean": "mean",
     }
+
+
+def test_video_decoder_sanitize_adds_identity_statistics_when_missing():
+    import mlx.core as mx
+
+    from mlx_video.models.ltx_2.video_vae.decoder import LTX2VideoDecoder
+
+    decoder = LTX2VideoDecoder(decoder_blocks=[])
+
+    sanitized = decoder.sanitize({"decoder.conv_in.conv.bias": mx.zeros((1,))})
+
+    assert sanitized["per_channel_statistics.mean"].shape == (128,)
+    assert sanitized["per_channel_statistics.std"].shape == (128,)
+    assert mx.all(sanitized["per_channel_statistics.mean"] == 0).item()
+    assert mx.all(sanitized["per_channel_statistics.std"] == 1).item()
