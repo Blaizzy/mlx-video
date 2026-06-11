@@ -282,11 +282,42 @@ class Resample(nn.Module):
         b, c, t, h, w = x.shape
 
         if self.mode == "upsample3d":
-            # Temporal upsample via learned conv
-            x_t = self.time_conv(x)  # [B, 2C, T, H, W]
-            x_t = x_t.reshape(b, 2, c, t, h, w)
-            x = mx.stack([x_t[:, 0], x_t[:, 1]], axis=3).reshape(b, c, t * 2, h, w)
-            t = t * 2
+            if feat_cache is not None:
+                idx = feat_idx[0]
+                if feat_cache[idx] is None:
+                    # First chunk: 'Rep' sentinel — skip time_conv so the
+                    # first latent frame is not temporally doubled (reference
+                    # Wan2.1 causal mapping: T latents -> 1 + (T-1)*4 frames)
+                    feat_cache[idx] = "Rep"
+                    feat_idx[0] += 1
+                else:
+                    cache_x = x[:, :, -CACHE_T:]
+                    was_rep = isinstance(feat_cache[idx], str)
+                    if cache_x.shape[2] < 2 and not was_rep:
+                        cache_x = mx.concatenate(
+                            [feat_cache[idx][:, :, -1:], cache_x], axis=2
+                        )
+                    elif cache_x.shape[2] < 2 and was_rep:
+                        cache_x = mx.concatenate(
+                            [mx.zeros_like(cache_x), cache_x], axis=2
+                        )
+                    if was_rep:
+                        x_t = self.time_conv(x)
+                    else:
+                        x_t = self.time_conv(x, cache_x=feat_cache[idx])
+                    feat_cache[idx] = cache_x
+                    feat_idx[0] += 1
+                    x_t = x_t.reshape(b, 2, c, t, h, w)
+                    x = mx.stack([x_t[:, 0], x_t[:, 1]], axis=3).reshape(
+                        b, c, t * 2, h, w
+                    )
+                    t = t * 2
+            else:
+                # Temporal upsample via learned conv
+                x_t = self.time_conv(x)  # [B, 2C, T, H, W]
+                x_t = x_t.reshape(b, 2, c, t, h, w)
+                x = mx.stack([x_t[:, 0], x_t[:, 1]], axis=3).reshape(b, c, t * 2, h, w)
+                t = t * 2
 
         if self.mode.startswith("upsample"):
             # Per-frame spatial upsample: nearest 2x + Conv2d
@@ -375,18 +406,45 @@ class Decoder3d(nn.Module):
             CausalConv3d(dims[-1], 3, 3, padding=1),  # [2]
         ]
 
-    def __call__(self, x: mx.array) -> mx.array:
+    def __call__(self, x: mx.array, feat_cache=None, feat_idx=None) -> mx.array:
         """x: [B, z_dim, T, H, W] -> [B, 3, T_out, H_out, W_out]"""
-        x = self.conv1(x)
+        if feat_cache is not None:
+            # conv1 with caching
+            idx = feat_idx[0]
+            cache_x = x[:, :, -CACHE_T:]
+            if cache_x.shape[2] < CACHE_T and feat_cache[idx] is not None:
+                cache_x = mx.concatenate([feat_cache[idx][:, :, -1:], cache_x], axis=2)
+            x = self.conv1(x, cache_x=feat_cache[idx])
+            feat_cache[idx] = cache_x
+            feat_idx[0] += 1
+        else:
+            x = self.conv1(x)
 
         for layer in self.middle:
-            x = layer(x)
+            if feat_cache is not None and isinstance(layer, ResidualBlock):
+                x = layer(x, feat_cache=feat_cache, feat_idx=feat_idx)
+            else:
+                x = layer(x)
 
         for layer in self.upsamples:
-            x = layer(x)
+            if feat_cache is not None and isinstance(layer, (ResidualBlock, Resample)):
+                x = layer(x, feat_cache=feat_cache, feat_idx=feat_idx)
+            else:
+                x = layer(x)
 
-        x = nn.silu(self.head[0](x))
-        x = self.head[2](x)
+        if feat_cache is not None:
+            # Head: norm -> silu -> [cache] -> conv
+            x = nn.silu(self.head[0](x))
+            idx = feat_idx[0]
+            cache_x = x[:, :, -CACHE_T:]
+            if cache_x.shape[2] < CACHE_T and feat_cache[idx] is not None:
+                cache_x = mx.concatenate([feat_cache[idx][:, :, -1:], cache_x], axis=2)
+            x = self.head[2](x, cache_x=feat_cache[idx])
+            feat_cache[idx] = cache_x
+            feat_idx[0] += 1
+        else:
+            x = nn.silu(self.head[0](x))
+            x = self.head[2](x)
         return x
 
 
@@ -559,21 +617,47 @@ class WanVAE(nn.Module):
         return count
 
     def decode(self, z: mx.array) -> mx.array:
-        """Decode latent to video.
+        """Decode latent to video using chunked decoding.
+
+        Decodes one latent frame at a time with temporal feature caching to
+        match reference behavior: T latent frames produce 1 + (T-1)*4 output
+        frames (the first latent frame is not temporally upsampled). Memory
+        stays flat in T.
 
         Args:
             z: Normalized latent [B, z_dim, T, H, W]
 
         Returns:
-            Video [B, 3, T_out, H_out, W_out] clamped to [-1, 1]
+            Video [B, 3, 1 + (T-1)*4, H_out, W_out] clamped to [-1, 1]
         """
         mean = self.mean.reshape(1, -1, 1, 1, 1)
         inv_std = self.inv_std.reshape(1, -1, 1, 1, 1)
         z = z / inv_std + mean
 
         x = self.conv2(z)
-        out = self.decoder(x)
+
+        num_slots = self._count_decoder_cache_slots()
+        feat_cache = [None] * num_slots
+        out = None
+        for i in range(x.shape[2]):
+            feat_idx = [0]
+            chunk = self.decoder(x[:, :, i : i + 1], feat_cache=feat_cache, feat_idx=feat_idx)
+            out = chunk if out is None else mx.concatenate([out, chunk], axis=2)
         return mx.clip(out, -1, 1)
+
+    def _count_decoder_cache_slots(self) -> int:
+        """Count CausalConv3d that participate in chunked decoding cache."""
+        count = 1  # decoder.conv1
+        for layer in self.decoder.middle:
+            if isinstance(layer, ResidualBlock):
+                count += 2
+        for layer in self.decoder.upsamples:
+            if isinstance(layer, ResidualBlock):
+                count += 2
+            elif isinstance(layer, Resample) and layer.mode == "upsample3d":
+                count += 1  # time_conv
+        count += 1  # decoder.head CausalConv3d
+        return count
 
     def decode_tiled(self, z: mx.array, tiling_config=None) -> mx.array:
         """Decode latent to video using tiling to reduce memory usage.
@@ -616,7 +700,14 @@ class WanVAE(nn.Module):
 
         def tile_decode(tile_latents, **kwargs):
             x = self.conv2(tile_latents)
-            out = self.decoder(x)
+            feat_cache = [None] * self._count_decoder_cache_slots()
+            out = None
+            for i in range(x.shape[2]):
+                feat_idx = [0]
+                chunk = self.decoder(
+                    x[:, :, i : i + 1], feat_cache=feat_cache, feat_idx=feat_idx
+                )
+                out = chunk if out is None else mx.concatenate([out, chunk], axis=2)
             return mx.clip(out, -1, 1)
 
         return decode_with_tiling(
@@ -625,5 +716,5 @@ class WanVAE(nn.Module):
             tiling_config=tiling_config,
             spatial_scale=8,  # 3× spatial 2× upsamples = 8×
             temporal_scale=4,  # 2× temporal upsamples × 2 = 4×
-            causal_temporal=False,  # Wan2.1 uses non-causal temporal (T → 4T)
+            causal_temporal=True,  # Wan2.1 causal mapping: T -> 1 + (T-1)*4
         )

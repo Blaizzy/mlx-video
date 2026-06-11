@@ -123,6 +123,36 @@ class TestWanVAE:
         assert len(VAE_STD) == 16
         assert all(s > 0 for s in VAE_STD)
 
+    def test_decode_causal_frame_count(self):
+        """Reference Wan2.1 mapping: T latent frames -> 1 + (T-1)*4 output
+        frames. The first latent frame is NOT temporally upsampled (the
+        'Rep' first-chunk sentinel skips time_conv in upsample3d)."""
+        import mlx.core as mx
+
+        from mlx_video.models.wan_2.vae import WanVAE
+
+        vae = WanVAE(z_dim=16)
+        for t_lat, t_out in [(1, 1), (2, 5), (5, 17)]:
+            z = mx.random.normal((1, 16, t_lat, 4, 4))
+            out = vae.decode(z)
+            assert out.shape == (1, 3, t_out, 32, 32), (
+                f"T={t_lat}: expected {t_out} frames, got {out.shape[2]}"
+            )
+
+    def test_decode_roundtrip_frame_count(self):
+        """encode(x) then decode should reproduce the input frame count for
+        the canonical 4k+1 frame videos."""
+        import mlx.core as mx
+
+        from mlx_video.models.wan_2.vae import WanVAE
+
+        vae = WanVAE(z_dim=16, encoder=True)
+        x = mx.random.normal((1, 3, 9, 32, 32))
+        z = vae.encode(x)
+        assert z.shape[2] == 3  # 1 + (9-1)/4
+        out = vae.decode(z)
+        assert out.shape[2] == 9
+
 
 # ---------------------------------------------------------------------------
 # Wan2.2 VAE Component Tests
