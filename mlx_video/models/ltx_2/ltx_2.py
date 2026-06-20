@@ -670,7 +670,7 @@ class LTXModel(nn.Module):
         config_dict = {}
         with open(model_path / "config.json", "r") as f:
             config_dict = json.load(f)
-        config = LTXModelConfig(**config_dict)
+        config = LTXModelConfig.from_dict(config_dict)
         model = cls(config)
 
         weights = {}
