@@ -698,7 +698,13 @@ def generate_video(
             )
         print()
 
-    # Free transformer models and text embeddings
+    # Free transformer models and text embeddings.
+    # The loop locals must be cleared too: `_call` is the mx.compile wrapper
+    # and holds the model through its traced graph (whose constants are the
+    # weight buffers), and `rcs`/`ctx` alias per-model tensors. Without this,
+    # the last-used transformer (~14-28GB for A14B) stays resident through the
+    # whole VAE decode and gc.collect()+mx.clear_cache() below free nothing.
+    model = kv = rcs = _call = ctx = None
     if is_dual:
         del low_noise_model, high_noise_model, cross_kv_low, cross_kv_high
         if cfg_disabled:
@@ -707,11 +713,12 @@ def generate_video(
             del context_cfg_low, context_cfg_high
     else:
         del single_model, cross_kv
+        rope_cos_sin = None
         if cfg_disabled:
             del context_cond
         else:
             del context_cfg
-    del model, kv, context
+    del context
     if context_null is not None:
         del context_null
     gc.collect()
