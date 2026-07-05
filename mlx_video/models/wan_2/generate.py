@@ -1,4 +1,23 @@
-"""Wan2.2 Text-to-Video generation pipeline for MLX."""
+"""Wan2.2 Text-to-Video generation pipeline for MLX.
+
+Dual-expert (A14B) memory modes: the two experts switch ONCE at a
+deterministic timestep boundary (high-noise phase, then low-noise phase).
+memory_mode="relay" (the default for dual models) keeps only the ACTIVE
+expert resident — build high, run the high phase, free it at the boundary,
+build low. Peak memory ~ one expert instead of two, which makes the A14B
+runnable in bf16 on 48GB unified memory (measured 36.8GB at 832x480x81f,
+44.3GB with CFG). Cost: one extra weight load from disk at the boundary,
+once per generation. memory_mode="parallel" restores both-resident behavior.
+
+Relay changes only WHEN weights are resident, never the math: with the same
+seed, relay and parallel produce bit-identical latents (contract-tested via
+dump_latents + MD5), and parallel is bit-identical with previous releases —
+relay pre-consumes the construction-time PRNG draws with discarded lazy
+replicas of the loader path, so the initial noise lands on the same stream
+position in every mode. (Known exception: quantized + LoRA in relay mode is
+deterministic but not seed-identical to parallel — the LoRA dequant-merge
+constructs extra layers whose PRNG use depends on the LoRA configs.)
+"""
 
 import argparse
 import gc
@@ -85,6 +104,8 @@ def generate_video(
     no_compile: bool = False,
     trim_first_frames: int = 0,
     debug_latents: bool = False,
+    memory_mode: str = "auto",
+    dump_latents: str | None = None,
 ):
     """Generate video using Wan pipeline (supports T2V and I2V).
 
@@ -118,6 +139,12 @@ def generate_video(
             discards first 4). Use 2 for more aggressive trimming. Default: 0.
         debug_latents: If True, print per-temporal-position latent statistics
             after denoising for diagnosing first-frame artifacts.
+        memory_mode: Expert residency for dual models. "parallel" = stock
+            behavior (both experts resident). "relay" = only the active expert
+            resident, freed/loaded at the phase boundary. "auto" = relay for
+            dual models, no-op for single. Ignored for single models.
+        dump_latents: Optional path; save the final pre-VAE latents as .npy
+            (float32) for bitwise relay-vs-parallel contract testing.
     """
     import json
 
@@ -127,6 +154,13 @@ def generate_video(
         FlowMatchEulerScheduler,
         FlowUniPCScheduler,
     )
+
+    # Fail fast on typos: a silently-unknown mode would neither prebuild nor
+    # free experts, degenerating into both-resident with no warning.
+    if memory_mode not in ("auto", "relay", "parallel"):
+        raise ValueError(
+            f"memory_mode must be 'auto', 'relay' or 'parallel', got {memory_mode!r}"
+        )
 
     model_dir = Path(model_dir)
 
@@ -316,6 +350,7 @@ def generate_video(
     w_latent = width // vae_stride[2]
     target_shape = (z_dim, t_latent, h_latent, w_latent)
 
+
     # Sequence length for transformer
     seq_len = math.ceil(
         (h_latent * w_latent) / (patch_size[1] * patch_size[2]) * t_latent
@@ -451,70 +486,7 @@ def generate_video(
     _loras_high = (loras or []) + (loras_high or []) or None
     _loras_single = loras
 
-    if is_dual:
-        low_noise_path = model_dir / "low_noise_model.safetensors"
-        high_noise_path = model_dir / "high_noise_model.safetensors"
-        low_noise_model = load_wan_model(
-            low_noise_path, config, quantization, loras=_loras_low
-        )
-        high_noise_model = load_wan_model(
-            high_noise_path, config, quantization, loras=_loras_high
-        )
-    else:
-        single_model = load_wan_model(
-            model_dir / "model.safetensors", config, quantization, loras=_loras_single
-        )
-    print(f"{Colors.DIM}  Models loaded: {time.time() - t2:.1f}s{Colors.RESET}")
-
-    # Precompute text embeddings once (avoids redundant MLP in every step)
-    # Each model has its own text_embedding weights, so dual models need separate embeddings
-    if cfg_disabled:
-        # No CFG: only compute cond embeddings (B=1 forward pass, 2x faster)
-        if is_dual:
-            context_emb_low = low_noise_model.embed_text([context])
-            context_emb_high = high_noise_model.embed_text([context])
-            mx.eval(context_emb_low, context_emb_high)
-            context_cond_low = context_emb_low[0:1]
-            context_cond_high = context_emb_high[0:1]
-        else:
-            context_emb = single_model.embed_text([context])
-            mx.eval(context_emb)
-            context_cond = context_emb[0:1]
-    else:
-        if is_dual:
-            context_emb_low = low_noise_model.embed_text([context, context_null])
-            context_emb_high = high_noise_model.embed_text([context, context_null])
-            mx.eval(context_emb_low, context_emb_high)
-            context_cfg_low = mx.concatenate(
-                [context_emb_low[0:1], context_emb_low[1:2]], axis=0
-            )
-            context_cfg_high = mx.concatenate(
-                [context_emb_high[0:1], context_emb_high[1:2]], axis=0
-            )
-        else:
-            context_emb = single_model.embed_text([context, context_null])
-            mx.eval(context_emb)
-            context_cfg = mx.concatenate([context_emb[0:1], context_emb[1:2]], axis=0)
-
-    # Precompute cross-attention K/V caches (constant across all steps)
-    if cfg_disabled:
-        if is_dual:
-            cross_kv_low = low_noise_model.prepare_cross_kv(context_cond_low)
-            cross_kv_high = high_noise_model.prepare_cross_kv(context_cond_high)
-            mx.eval(cross_kv_low, cross_kv_high)
-        else:
-            cross_kv = single_model.prepare_cross_kv(context_cond)
-            mx.eval(cross_kv)
-    else:
-        if is_dual:
-            cross_kv_low = low_noise_model.prepare_cross_kv(context_cfg_low)
-            cross_kv_high = high_noise_model.prepare_cross_kv(context_cfg_high)
-            mx.eval(cross_kv_low, cross_kv_high)
-        else:
-            cross_kv = single_model.prepare_cross_kv(context_cfg)
-            mx.eval(cross_kv)
-
-    # Precompute RoPE frequencies (grid sizes are constant across all steps)
+    # RoPE grid sizes are constant across all steps and independent of the model
     f_grid = t_latent // patch_size[0]
     h_grid = h_latent // patch_size[1]
     w_grid = w_latent // patch_size[2]
@@ -522,13 +494,140 @@ def generate_video(
         rope_grid_sizes = [(f_grid, h_grid, w_grid)]
     else:
         rope_grid_sizes = [(f_grid, h_grid, w_grid), (f_grid, h_grid, w_grid)]
+
+    if memory_mode == "auto":
+        memory_mode = "relay" if is_dual else "parallel"
+    if memory_mode not in ("relay", "parallel"):
+        raise ValueError(
+            f"memory_mode must be 'relay', 'parallel' or 'auto', got {memory_mode!r}"
+        )
+
+    def _build_expert(which, restore_rng=False):
+        """Load one expert and its per-model precomputes (text embedding,
+        cross-attn K/V, RoPE tables). Everything the denoise loop needs from
+        a resident expert lives in the returned bundle; freeing the bundle
+        frees the expert."""
+        path = model_dir / f"{which}_noise_model.safetensors"
+        loras_w = _loras_high if which == "high" else _loras_low
+        tb = time.time()
+        # restore_rng=True ONLY for deferred (in-loop) relay builds: those
+        # must not perturb the global PRNG stream. The provider-init builds in
+        # parallel mode must consume the stream normally so parallel keeps the
+        # historical construction-order behavior.
+        _saved_rng = None
+        if restore_rng:
+            try:
+                _saved_rng = mx.random.state[0]
+            except Exception:
+                pass
+        m = load_wan_model(path, config, quantization, loras=loras_w)
+        if _saved_rng is not None:
+            mx.random.state[0] = _saved_rng
+        if cfg_disabled:
+            emb = m.embed_text([context])
+            mx.eval(emb)
+            ctx = emb[0:1]
+        else:
+            emb = m.embed_text([context, context_null])
+            mx.eval(emb)
+            ctx = mx.concatenate([emb[0:1], emb[1:2]], axis=0)
+        kv = m.prepare_cross_kv(ctx)
+        rcs = m.prepare_rope(rope_grid_sizes)
+        mx.eval(ctx, kv, rcs)
+        if not no_compile:
+            m._compiled = mx.compile(m)
+        print(
+            f"{Colors.DIM}  [{memory_mode}] {which}-noise expert ready: "
+            f"{time.time() - tb:.1f}s{Colors.RESET}"
+        )
+        return {"model": m, "ctx": ctx, "kv": kv, "rcs": rcs}
+
+    class _PhaseProvider:
+        """Hands the denoise loop the bundle for the expert active at a given
+        timestep. parallel = both resident (stock behavior); relay = only the
+        active one, with a free+load at each phase change. The math is
+        identical in both modes — only weight residency differs."""
+
+        def __init__(self, mode):
+            self.mode = mode
+            self.bundles = {}
+            if mode == "parallel":
+                self.bundles["low"] = _build_expert("low")
+                self.bundles["high"] = _build_expert("high")
+            else:
+                # PRNG parity with stock/parallel: model construction consumes
+                # the global PRNG stream (keyless layer inits AND the
+                # QuantizedLinear constructors inside nn.quantize), and stock
+                # builds BOTH experts between mx.random.seed() and the initial
+                # noise draw. Relay defers the real builds, so pre-consume the
+                # stream with two discarded LAZY replicas of the loader's
+                # construction path (arrays are never evaluated — near-zero
+                # cost). Verified: replica consumption == real-loader
+                # consumption, so the noise (and every output) is bit-exact
+                # with parallel AND with previous releases for the same seed.
+                # Known exception: quantized models + LoRA (the dequant-merge
+                # path constructs additional Linears whose RNG use depends on
+                # the LoRA configs) — relay stays deterministic per-mode there
+                # but same-seed output differs from parallel.
+                import mlx.nn as _nn
+
+                from mlx_video.models.wan_2.convert import _quantize_predicate
+                from mlx_video.models.wan_2.wan_2 import WanModel as _WM
+
+                for _ in ("low", "high"):
+                    _replica = _WM(config)
+                    if quantization:
+                        _nn.quantize(
+                            _replica,
+                            group_size=quantization["group_size"],
+                            bits=quantization["bits"],
+                            class_predicate=lambda p, m: _quantize_predicate(p, m),
+                        )
+                    del _replica
+
+        def get(self, timestep_val):
+            which = "high" if timestep_val >= boundary else "low"
+            if which not in self.bundles:
+                if self.mode == "relay":
+                    self._free_all()
+                self.bundles[which] = _build_expert(which, restore_rng=True)
+            return self.bundles[which]
+
+        def _free_all(self):
+            for b in list(self.bundles.values()):
+                b.clear()
+            self.bundles.clear()
+            gc.collect()
+            mx.clear_cache()
+
+        def close(self):
+            self._free_all()
+
+    # Boundary for model switching (dual model only) — parity-critical constant,
+    # single definition point (used by provider.get AND guide_scale selection)
+    boundary = (config.boundary * config.num_train_timesteps) if is_dual else None
+
+    provider = None
     if is_dual:
-        rope_cos_sin_low = low_noise_model.prepare_rope(rope_grid_sizes)
-        rope_cos_sin_high = high_noise_model.prepare_rope(rope_grid_sizes)
-        mx.eval(rope_cos_sin_low, rope_cos_sin_high)
+        provider = _PhaseProvider(memory_mode)
     else:
+        single_model = load_wan_model(
+            model_dir / "model.safetensors", config, quantization, loras=_loras_single
+        )
+        if cfg_disabled:
+            context_emb = single_model.embed_text([context])
+            mx.eval(context_emb)
+            context_cond = context_emb[0:1]
+            cross_kv = single_model.prepare_cross_kv(context_cond)
+        else:
+            context_emb = single_model.embed_text([context, context_null])
+            mx.eval(context_emb)
+            context_cfg = mx.concatenate([context_emb[0:1], context_emb[1:2]], axis=0)
+            cross_kv = single_model.prepare_cross_kv(context_cfg)
+        mx.eval(cross_kv)
         rope_cos_sin = single_model.prepare_rope(rope_grid_sizes)
         mx.eval(rope_cos_sin)
+    print(f"{Colors.DIM}  Models loaded: {time.time() - t2:.1f}s{Colors.RESET}")
 
     # Setup scheduler
     _schedulers = {
@@ -540,7 +639,10 @@ def generate_video(
     sched = sched_cls(num_train_timesteps=config.num_train_timesteps)
     sched.set_timesteps(steps, shift=shift)
 
-    # Generate initial noise
+    # Generate initial noise — at the SAME stream position as previous
+    # versions (after both experts' construction-time PRNG consumption):
+    # parallel mode is bit-exact with prior releases, and relay pre-consumed
+    # an identical amount via lazy replicas (see _PhaseProvider.__init__).
     noise = mx.random.normal(target_shape)
 
     # I2V initialization: TI2V-5B blends image with noise, I2V-14B uses pure noise
@@ -549,20 +651,15 @@ def generate_video(
     else:
         latents = noise
 
-    # Boundary for model switching (dual model only)
-    boundary = (config.boundary * config.num_train_timesteps) if is_dual else None
-
     # Diffusion loop
     print(f"\n{Colors.GREEN}Denoising ({steps} steps)...{Colors.RESET}")
     t3 = time.time()
 
-    # Compile model forward for faster denoising
-    if not no_compile:
-        models_to_compile = (
-            [high_noise_model, low_noise_model] if is_dual else [single_model]
-        )
-        for m in models_to_compile:
-            m._compiled = mx.compile(m)
+    # Compile model forward for faster denoising.
+    # Dual experts are compiled inside _build_expert (relay mode may not have
+    # both resident here); only the single-model path is compiled at this point.
+    if not no_compile and not is_dual:
+        single_model._compiled = mx.compile(single_model)
 
     # Pre-convert timesteps to Python list to avoid .item() sync each step
     timestep_list = sched.timesteps.tolist()
@@ -572,14 +669,14 @@ def generate_video(
 
         # Select model, cached K/V, and precomputed RoPE
         if is_dual:
-            if timestep_val >= boundary:
-                model = high_noise_model
-                kv = cross_kv_high
-                rcs = rope_cos_sin_high
-            else:
-                model = low_noise_model
-                kv = cross_kv_low
-                rcs = rope_cos_sin_low
+            # Drop stale aliases BEFORE provider.get: at the phase boundary the
+            # previous iteration's locals would otherwise keep the outgoing
+            # expert alive through _free_all, defeating the relay (peak = both).
+            model = kv = rcs = _call = ctx = _bundle = None
+            _bundle = provider.get(timestep_val)
+            model = _bundle["model"]
+            kv = _bundle["kv"]
+            rcs = _bundle["rcs"]
         else:
             model = single_model
             kv = cross_kv
@@ -604,9 +701,7 @@ def generate_video(
             y_arg = [y_i2v] if is_i2v_channel_concat else None
 
             if is_dual:
-                ctx = (
-                    context_cond_high if timestep_val >= boundary else context_cond_low
-                )
+                ctx = _bundle["ctx"]
             else:
                 ctx = context_cond
             preds = _call(
@@ -644,11 +739,7 @@ def generate_video(
 
             y_arg = [y_i2v, y_i2v] if is_i2v_channel_concat else None
 
-            ctx = (
-                context_cfg
-                if not is_dual
-                else (context_cfg_high if timestep_val >= boundary else context_cfg_low)
-            )
+            ctx = context_cfg if not is_dual else _bundle["ctx"]
             preds = _call(
                 [latents, latents],
                 t=t_batch,
@@ -698,20 +789,29 @@ def generate_video(
             )
         print()
 
-    # Free transformer models and text embeddings
+    # Contract-test hook: final pre-VAE latents, before anything stochastic
+    # or lossy (VAE, mp4 encode) touches them
+    if dump_latents:
+        np.save(dump_latents, np.array(latents.astype(mx.float32)))
+        print(f"{Colors.DIM}  Latents dumped to {dump_latents}{Colors.RESET}")
+
+    # Free transformer models and text embeddings. Drop ALL loop aliases first:
+    # _call is the mx.compile wrapper and closes over the model (traced tape
+    # holds the weight buffers); rcs/ctx alias its tables. Missing any of these
+    # keeps the last expert resident through the whole VAE decode — stock has
+    # the same leak via the identical loop locals (upstream-fix candidate).
+    # None-assignment (not del) also survives the steps==0 edge case.
+    model = kv = rcs = _call = ctx = _bundle = None
     if is_dual:
-        del low_noise_model, high_noise_model, cross_kv_low, cross_kv_high
-        if cfg_disabled:
-            del context_cond_low, context_cond_high
-        else:
-            del context_cfg_low, context_cfg_high
+        provider.close()
     else:
         del single_model, cross_kv
         if cfg_disabled:
             del context_cond
         else:
             del context_cfg
-    del model, kv, context
+        rope_cos_sin = None
+    del context
     if context_null is not None:
         del context_null
     gc.collect()
@@ -930,6 +1030,23 @@ def main():
         action="store_true",
         help="Print per-temporal-position latent statistics after denoising (diagnostic)",
     )
+    parser.add_argument(
+        "--memory-mode",
+        type=str,
+        default="auto",
+        choices=["auto", "relay", "parallel"],
+        help="Dual-model expert residency: relay = only the active expert in "
+        "memory, swapped once at the phase boundary (fits A14B bf16 on 48GB); "
+        "parallel = both resident. auto (default) = relay for dual models",
+    )
+    parser.add_argument(
+        "--dump-latents",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help="Save the final pre-VAE latents as float32 .npy (for bitwise "
+        "relay-vs-parallel contract testing)",
+    )
     args = parser.parse_args()
 
     # Parse guide scale
@@ -970,6 +1087,8 @@ def main():
         no_compile=args.no_compile,
         trim_first_frames=args.trim_first_frames,
         debug_latents=args.debug_latents,
+        memory_mode=args.memory_mode,
+        dump_latents=args.dump_latents,
     )
 
 
