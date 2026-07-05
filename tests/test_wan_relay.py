@@ -46,16 +46,26 @@ def test_cli_exposes_memory_mode():
 
 @pytest.mark.skipif(not A14B_DIR, reason="set WAN22_A14B_DIR to a converted dual-model dir")
 def test_relay_parallel_bit_identical():
-    """Same seed, relay vs parallel: pre-VAE latents must match byte-for-byte."""
+    """Same seed, relay vs parallel: pre-VAE latents must match byte-for-byte.
+
+    A14B checkpoints are typically I2V (in_dim=36, image conditioning
+    required), so a synthetic keyframe is generated on the fly; T2V dual
+    models work the same way with image=None.
+    """
+    from PIL import Image
+
     from mlx_video.models.wan_2.generate import generate_video
 
     digests = {}
     with tempfile.TemporaryDirectory() as td:
+        img = Path(td) / "key.png"
+        Image.new("RGB", (448, 256), (90, 110, 140)).save(img)
         for mode in ("parallel", "relay"):
             lat = Path(td) / f"{mode}.npy"
             generate_video(
                 model_dir=A14B_DIR,
                 prompt="a red cube on a wooden table, studio light",
+                image=str(img),
                 width=448,
                 height=256,
                 num_frames=9,
