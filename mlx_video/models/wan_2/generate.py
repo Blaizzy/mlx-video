@@ -10,12 +10,13 @@ runnable in bf16 on 48GB unified memory (measured 36.8GB at 832x480x81f,
 once per generation. memory_mode="parallel" restores both-resident behavior.
 
 Relay changes only WHEN weights are resident, never the math: with the same
-seed relay and parallel produce bit-identical latents (contract-tested via
-dump_latents + MD5). To make that guarantee structural, the initial noise is
-drawn BEFORE any transformer weight loading, so the sample cannot depend on
-how many PRNG draws model construction consumes. NOTE: this changes
-same-seed outputs relative to earlier versions (which drew the noise after
-building both experts).
+seed, relay and parallel produce bit-identical latents (contract-tested via
+dump_latents + MD5), and parallel is bit-identical with previous releases —
+relay pre-consumes the construction-time PRNG draws with discarded lazy
+replicas of the loader path, so the initial noise lands on the same stream
+position in every mode. (Known exception: quantized + LoRA in relay mode is
+deterministic but not seed-identical to parallel — the LoRA dequant-merge
+constructs extra layers whose PRNG use depends on the LoRA configs.)
 """
 
 import argparse
@@ -349,15 +350,6 @@ def generate_video(
     w_latent = width // vae_stride[2]
     target_shape = (z_dim, t_latent, h_latent, w_latent)
 
-    # Draw the initial noise HERE, before any weight loading (deliberate
-    # deviation from stock, which draws it after building both experts).
-    # Model construction consumes the global PRNG stream by an amount that
-    # depends on loader internals (layer inits, QuantizedLinear constructors
-    # inside nn.quantize, ...): drawing first makes the sample independent of
-    # all of it, which is what guarantees relay == parallel bit-identically.
-    # Same-seed outputs therefore differ from stock's by design.
-    noise = mx.random.normal(target_shape)
-    mx.eval(noise)
 
     # Sequence length for transformer
     seq_len = math.ceil(
@@ -562,12 +554,36 @@ def generate_video(
             if mode == "parallel":
                 self.bundles["low"] = _build_expert("low")
                 self.bundles["high"] = _build_expert("high")
-            # relay: nothing to pre-consume — the initial noise is drawn
-            # BEFORE any construction (see the draw next to target_shape), so
-            # PRNG consumption during builds cannot influence the sample.
-            # (Draw-counting equalization is not viable: construction draws
-            # depend on loader internals, e.g. nn.quantize's QuantizedLinear
-            # constructors consume extra RNG.)
+            else:
+                # PRNG parity with stock/parallel: model construction consumes
+                # the global PRNG stream (keyless layer inits AND the
+                # QuantizedLinear constructors inside nn.quantize), and stock
+                # builds BOTH experts between mx.random.seed() and the initial
+                # noise draw. Relay defers the real builds, so pre-consume the
+                # stream with two discarded LAZY replicas of the loader's
+                # construction path (arrays are never evaluated — near-zero
+                # cost). Verified: replica consumption == real-loader
+                # consumption, so the noise (and every output) is bit-exact
+                # with parallel AND with previous releases for the same seed.
+                # Known exception: quantized models + LoRA (the dequant-merge
+                # path constructs additional Linears whose RNG use depends on
+                # the LoRA configs) — relay stays deterministic per-mode there
+                # but same-seed output differs from parallel.
+                import mlx.nn as _nn
+
+                from mlx_video.models.wan_2.convert import _quantize_predicate
+                from mlx_video.models.wan_2.wan_2 import WanModel as _WM
+
+                for _ in ("low", "high"):
+                    _replica = _WM(config)
+                    if quantization:
+                        _nn.quantize(
+                            _replica,
+                            group_size=quantization["group_size"],
+                            bits=quantization["bits"],
+                            class_predicate=lambda p, m: _quantize_predicate(p, m),
+                        )
+                    del _replica
 
         def get(self, timestep_val):
             which = "high" if timestep_val >= boundary else "low"
@@ -623,8 +639,11 @@ def generate_video(
     sched = sched_cls(num_train_timesteps=config.num_train_timesteps)
     sched.set_timesteps(steps, shift=shift)
 
-    # (initial noise already drawn right after target_shape, before any
-    # weight loading — see the PRNG-independence note there)
+    # Generate initial noise — at the SAME stream position as previous
+    # versions (after both experts' construction-time PRNG consumption):
+    # parallel mode is bit-exact with prior releases, and relay pre-consumed
+    # an identical amount via lazy replicas (see _PhaseProvider.__init__).
+    noise = mx.random.normal(target_shape)
 
     # I2V initialization: TI2V-5B blends image with noise, I2V-14B uses pure noise
     if is_i2v_mask_blend:
