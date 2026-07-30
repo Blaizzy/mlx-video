@@ -497,6 +497,19 @@ class WanS2VModel(WanModel):
     def _ref_patch_tokens(self, ref_image_latent: mx.array) -> tuple:
         """Patchify a single reference-image latent frame → tokens + seg embed.
 
+        Matches kijai wanvideo/modules/model.py lines 2636-2650: ref latent is
+        patch-embedded, gets ``cond_mask_weight[1]`` (segment 1), then when the
+        full noise+ref+padding sequence is assembled kijai adds
+        ``cond_mask_weight[0]`` to the entire sequence — so ref tokens end up
+        with BOTH ``weight[0]`` and ``weight[1]`` added on top of the raw patch
+        embedding. Noise tokens only get ``weight[0]``.
+
+        In MLX we bake both segment vectors into the ref tokens here (noise
+        tokens already receive ``segment_embedding(0)`` in ``__call__``). This
+        makes the ref token project into the same video-space subspace as noise
+        (via weight[0]) while retaining the segment-1 identity signal, which
+        is what actually locks the generated face to the reference.
+
         Args:
             ref_image_latent: (C=16, 1, H_lat, W_lat) or (C, F_ref, H, W).
 
@@ -504,11 +517,15 @@ class WanS2VModel(WanModel):
             (ref_tokens [1, L_ref, D], grid (F_ref', H', W'))
         """
         p, gs = self._patchify_5d(ref_image_latent)
-        # Add ref-segment embedding (seg id = 1).
-        seg = self.trainable_cond_mask.segment_embedding(
+        # Add BOTH the noise-baseline (seg 0) and ref-segment (seg 1) embeddings
+        # to match kijai's post-concat behaviour (Phase 3 identity-preservation fix).
+        seg0 = self.trainable_cond_mask.segment_embedding(
+            0, p.shape[1], dtype=p.dtype
+        )[None, :, :]
+        seg1 = self.trainable_cond_mask.segment_embedding(
             1, p.shape[1], dtype=p.dtype
         )[None, :, :]
-        return p + seg.astype(p.dtype), gs
+        return p + seg0.astype(p.dtype) + seg1.astype(p.dtype), gs
 
     def _motion_bucket_shapes(self, H_lat: int, W_lat: int) -> list:
         """Return list of (F_seg, H_seg, W_seg) per motion bucket after patchify.
