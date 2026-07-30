@@ -414,10 +414,14 @@ class WanS2VModel(WanModel):
       7. Head → unpatchify first F*N tokens → return epsilon predictions of
          shape [C_out, F, H, W] per batch element.
 
-    TODO(verify): many details below (ref token count, ref RoPE temporal
-    index, framepack RoPE assignment, exact seg_idx handling in modulation)
-    are best-effort reconstructions from the design doc and will need a
-    parity check against ``wan/modules/s2v/model_s2v.py`` on the Mac.
+    Ref RoPE temporal index (verified against kijai ``rope_encode_comfy``,
+    line 2703): ``t_start = max(30, F_video + 9)``. For F=21 (81-frame clip)
+    this is 30, matching the design-doc value; for longer clips it grows.
+
+    The current implementation deliberately SKIPS per-token RoPE reassignment
+    for ref/motion — noise-slice RoPE only. This is a functional first cut;
+    numerical parity with kijai will require reworking the ``rope_cos_sin``
+    to take three separate temporal grids and concatenate.
     """
 
     def __init__(self, config: WanModelConfig):
@@ -741,10 +745,11 @@ class WanS2VModel(WanModel):
         # Note: we deliberately reuse the T2V rope_cos_sin path only for the
         # noise slice; ref/motion tokens skip RoPE in self-attention because
         # they are appended *after* the noise slice and RoPE is applied per
-        # grid_sizes[i] which describes only the noise slice. TODO(verify):
-        # the reference implementation may apply special RoPE positions for
-        # ref (temporal idx 30) and motion (negative t). Skipping is a
-        # conservative first cut that keeps shapes consistent.
+        # grid_sizes[i] which describes only the noise slice. Verified vs
+        # kijai (rope_encode_comfy, line 2703): ref RoPE uses t_start =
+        # max(30, F_video + 9), motion RoPE uses t_start = -1/-3/-19 for
+        # the post/2x/4x buckets. Full parity would require rebuilding
+        # rope_cos_sin with three concatenated temporal grids — deferred.
         kwargs = dict(
             e=e_block,
             seq_lens=[seq_total] * batch_size,

@@ -26,26 +26,19 @@ from .attention import WanCrossAttention, WanRMSNorm, _linear_dtype
 
 
 class AdaLayerNorm(nn.Module):
-    """Diffusers-style AdaLN with no internal LayerNorm.
+    """Diffusers-style AdaLN with internal LayerNorm.
 
-    Weight layout (matches state-dict key ``.linear.weight/bias``):
+    Verified against kijai reference (wanvideo/modules/model.py lines 46-63):
         linear.weight: (2 * output_dim, embedding_dim)
         linear.bias:   (2 * output_dim,)
 
     Forward:
-        x:    (..., output_dim)   already-normalised hidden states
-        temb: (..., embedding_dim) conditioning embedding
+        temb = linear(SiLU(temb))
+        shift, scale = temb.chunk(2, dim=1)
+        x = LayerNorm(x, affine=False) * (1 + scale) + shift
 
-    Returns:
-        x * (1 + scale) + shift    where (scale, shift) = chunk(linear(SiLU(temb)))
-
-    Design doc R5 explicitly says the released S2V variant uses no interior
-    LayerNorm — it is applied *after* the parent module's attn norm
-    (``adain_mode == "attn_norm"``).
-
-    TODO(verify): whether the reference applies SiLU on temb before the linear.
-    Diffusers ``AdaLayerNorm`` does; if the S2V variant skips it, remove the
-    ``nn.silu`` call below.
+    The internal LayerNorm is ``elementwise_affine=False, eps=1e-5`` — no
+    trainable params, but it does normalize x before modulation.
     """
 
     def __init__(self, embedding_dim: int, output_dim: int, chunk_dim: int = 1):
@@ -54,18 +47,26 @@ class AdaLayerNorm(nn.Module):
         self.output_dim = output_dim
         self.chunk_dim = chunk_dim
         self.linear = nn.Linear(embedding_dim, 2 * output_dim)
+        # Kijai uses nn.LayerNorm(output_dim // 2, eps=1e-5, affine=False).
+        # `output_dim // 2` in kijai is because the caller passes 2*dim; we
+        # already pass `output_dim` = target hidden dim, so norm dim = output_dim.
+        # No affine params → no state-dict keys to load.
+        self.norm = nn.LayerNorm(output_dim, eps=1e-5, affine=False)
 
     def __call__(self, x: mx.array, temb: mx.array) -> mx.array:
-        # SiLU(temb) → Linear → (scale, shift)
+        # linear(SiLU(temb)) → chunk into (shift, scale)
         w_dtype = _linear_dtype(self.linear)
         temb_a = nn.silu(temb.astype(w_dtype))
         scale_shift = self.linear(temb_a)
-        # chunk along last dim into (scale, shift), each of shape (..., output_dim)
+        # Kijai order: shift, scale = temb.chunk(2, dim=1). But note that this
+        # follows the DiT convention where the FIRST half is shift, second is
+        # scale. We keep the same ordering.
         half = self.output_dim
-        scale = scale_shift[..., :half]
-        shift = scale_shift[..., half:]
-        # Broadcast-safe: scale/shift may have fewer trailing tokens than x.
-        return x * (1 + scale.astype(x.dtype)) + shift.astype(x.dtype)
+        shift = scale_shift[..., :half]
+        scale = scale_shift[..., half:]
+        # LayerNorm x, then modulate.
+        x_norm = self.norm(x)
+        return x_norm * (1 + scale.astype(x.dtype)) + shift.astype(x.dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -274,10 +275,16 @@ class FramePacker(nn.Module):
     frames; each temporal token grid is projected independently and the
     resulting token lists are returned as three flat sequences.
 
-    TODO(verify): the exact bucket ordering and drop-mode semantics
-    (``framepack_drop_mode == "padd"`` — pad instead of drop when history is
-    shorter than 19 latent frames). This implementation zero-pads the missing
-    prefix and applies all three projections.
+    Bucket ordering verified against kijai reference
+    (wanvideo/modules/model.py FramePackMotioner.forward): kijai splits by
+    ``self.zip_frame_buckets[::-1]`` = [16, 2, 1] which yields
+    (clean_latents_4x=coarse, clean_latents_2x=medium, clean_latents_post=fine),
+    then CONCATENATES in the order **[post, 2x, 4x]** = [fine, medium, coarse].
+    So the returned motion token list is ``[fine, medium, coarse]``, matching
+    kijai's t_start assignments of ``-1, -3, -19`` (near-past first).
+
+    When history is shorter than 19 latent frames, kijai zero-pads *at the
+    front* (the ``padd_lat[:, :, -overlap_frame:]`` fill).
     """
 
     def __init__(
@@ -336,7 +343,8 @@ class FramePacker(nn.Module):
         toks_coarse = _flatten(self.proj_4x(coarse))
         toks_medium = _flatten(self.proj_2x(medium))
         toks_fine = _flatten(self.proj(fine))
-        return [toks_coarse, toks_medium, toks_fine]
+        # Kijai concatenates in order [post, 2x, 4x] = [fine, medium, coarse].
+        return [toks_fine, toks_medium, toks_coarse]
 
 
 # Back-compat alias — Phase 1 test imports FramePackerStub.

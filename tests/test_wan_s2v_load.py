@@ -248,7 +248,10 @@ class TestSanitizerRoundtrip:
         cfg = _make_tiny_s2v_config()
         model = WanS2VModel(cfg)
         mlx_params = dict(mlx.utils.tree_flatten(model.parameters()))
-        expected_keys = set(mlx_params.keys())
+        # `freqs` is a RoPE buffer computed at model init, not a loaded
+        # checkpoint parameter — the sanitizer intentionally skips it
+        # (see convert.py sanitize_wan_transformer_weights lines 150-151).
+        expected_keys = {k for k in mlx_params.keys() if k != "freqs"}
 
         pt_state_dict = _synthesize_s2v_state_dict(cfg)
         sanitized = sanitize_wan_s2v_weights(pt_state_dict)

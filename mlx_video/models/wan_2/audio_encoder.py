@@ -134,7 +134,8 @@ class MotionEncoder_tc(nn.Module):
         self.conv2 = _CausalConv1dModule(hidden_dim // 4, hidden_dim // 2, kernel_size=3)
         self.conv3 = _CausalConv1dModule(hidden_dim // 2, hidden_dim, kernel_size=3)
 
-        # Activation between convs. TODO(verify): reference uses SiLU or GELU.
+        # Activation between convs. Verified SiLU (kijai wanvideo/modules/s2v/
+        # auxi_blocks.py MotionEncoder_tc.__init__ line 62: `self.act = nn.SiLU()`).
         self.act = nn.SiLU()
 
         if need_global:
@@ -237,8 +238,7 @@ class CausalAudioEncoder(nn.Module):
         self.num_token = num_token
         self.need_global = need_global
 
-        # Learnable per-layer weighting. Initialised as-if uniform; the
-        # softmax below turns any values into a probability distribution.
+        # Learnable per-layer weighting. Kijai init: torch.ones() * 0.01.
         self.weights = mx.full((1, num_layers, 1, 1), 0.01, dtype=mx.float32)
         self.encoder = MotionEncoder_tc(
             in_dim=dim,
@@ -249,10 +249,16 @@ class CausalAudioEncoder(nn.Module):
 
     def __call__(self, features: mx.array):
         # features: (B, num_layers, dim, T_audio)
-        # Softmax the layer weights along axis=1 to normalise contribution.
-        w = mx.softmax(self.weights.astype(mx.float32), axis=1)
-        # Weighted sum -> (B, dim, T_audio)
-        x = (features.astype(mx.float32) * w).sum(axis=1)
+        # Kijai (wanvideo/modules/model.py CausalAudioEncoder.forward):
+        #   weights = SiLU(self.weights)
+        #   weights_sum = weights.sum(dim=1, keepdim=True)
+        #   weighted_feat = ((features * weights) / weights_sum).sum(dim=1)
+        # This is SiLU-then-normalize (NOT softmax).
+        w = nn.silu(self.weights.astype(mx.float32))
+        w_sum = w.sum(axis=1, keepdims=True)
+        x = ((features.astype(mx.float32) * w) / w_sum).sum(axis=1)
+        # x: (B, dim, T_audio). MotionEncoder_tc.__call__ expects
+        # (B, in_dim, T_audio) channels-first — pass through.
         return self.encoder(x)
 
 
@@ -279,9 +285,10 @@ def extract_wav2vec_features(
         wav_path: path to a mono .wav file.
         num_video_frames: number of video frames the S2V model will generate.
         num_audio_token: audio tokens per video frame (4 for released S2V-14B).
-        model_name: HF wav2vec2 checkpoint. TODO(verify): the S2V paper uses
-            ``facebook/wav2vec2-large-xlsr-53`` (25 hidden states). Alternate
-            candidates: ``TencentGameMate/chinese-wav2vec2-large`` for Chinese.
+        model_name: HF wav2vec2 checkpoint OR local directory path. Verified
+            against the Wan-AI/Wan2.2-S2V-14B repo listing: the S2V weights
+            ship with ``wav2vec2-large-xlsr-53-english/`` alongside the DiT
+            shards. When available locally, pass that folder path directly.
         target_sr: sample rate the wav2vec2 model expects (16 kHz).
 
     Returns:
@@ -339,7 +346,9 @@ def extract_wav2vec_features(
         # F.interpolate expects (N, C, L) — collapse the layer axis into channels.
         B, L, D, T_wav = hs.shape
         hs_flat = hs.reshape(B, L * D, T_wav)
-        hs_flat = F.interpolate(hs_flat, size=T_target, mode="linear", align_corners=False)
+        # Kijai (wanvideo/modules/s2v/audio_encoder.py linear_interpolation):
+        # F.interpolate(..., mode="linear", align_corners=True).
+        hs_flat = F.interpolate(hs_flat, size=T_target, mode="linear", align_corners=True)
         hs = hs_flat.reshape(B, L, D, T_target)
 
     return mx.array(hs.cpu().numpy())
