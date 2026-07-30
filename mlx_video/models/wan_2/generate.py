@@ -1040,6 +1040,19 @@ def generate_s2v_video(
     ref_grid = (
         (z_ref.shape[1], h_grid, w_grid) if z_ref is not None else None
     )
+    # Early-fail if dimensions won't survive the coarse motion-projection.
+    # coarse proj kernel is (4, 8, 8); h_latent = height // vae_stride[1] must
+    # be divisible by 8. In practice: height AND width must be divisible by
+    # (vae_stride * 8) = 64.  Better a clear message here than an AssertionError
+    # inside pack_motion_frames on step 0.
+    if h_latent % 8 != 0 or w_latent % 8 != 0:
+        raise ValueError(
+            f"S2V dimensions height={height}, width={width} give latent grid "
+            f"H={h_latent}, W={w_latent}. Coarse motion kernel is (4,8,8) so "
+            f"latent H and W must be divisible by 8 (i.e. pixel height/width "
+            f"must be divisible by 64). Try e.g. 448x256, 512x320, 640x384."
+        )
+
     # First-clip motion history: kijai (nodes_sampler.py L2079-2124) trains with
     # motion tokens ALWAYS present -- on the first clip the wrapper builds a
     # zero pixel tensor of shape [1, 3, motion_frames=73, H, W], VAE-encodes it
