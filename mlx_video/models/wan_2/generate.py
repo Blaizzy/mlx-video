@@ -1069,12 +1069,12 @@ def generate_s2v_video(
     )
     mx.eval(zero_motion_latent)
 
-    # RoPE now must cover motion segments too; derive their bucket shapes from
-    # the noise latent H/W (matches WanS2VModel._motion_bucket_shapes).
+    # RoPE covers motion segments; shapes are the TOKEN-grid dims after each
+    # FramePacker projection kernel (mirrors WanS2VModel._motion_bucket_shapes).
     motion_shapes = [
-        (1, h_latent, w_latent),                # fine   -- proj (1,2,2)
-        (1, h_latent // 2, w_latent // 2),      # medium -- proj (2,4,4)
-        (4, h_latent // 4, w_latent // 4),      # coarse -- proj (4,8,8)
+        (1, h_latent // 2, w_latent // 2),      # fine   -- proj (1,2,2)
+        (1, h_latent // 4, w_latent // 4),      # medium -- proj (2,4,4)
+        (4, h_latent // 8, w_latent // 8),      # coarse -- proj (4,8,8)
     ]
     rope_cos_sin = single_model.prepare_rope_s2v(
         noise_grid=(f_grid, h_grid, w_grid),

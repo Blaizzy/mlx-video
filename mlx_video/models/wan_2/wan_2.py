@@ -552,13 +552,17 @@ class WanS2VModel(WanModel):
             medium.h = H_lat / 4      = H_noise / 2
             coarse.h = H_lat / 8      = H_noise / 4
         """
-        # Motion buckets from the FramePacker output. Latent H/W == 2 * noise
-        # patch H/W (since patch kernel is (1,2,2)); we're given noise-grid H/W
-        # so H_lat = 2 * H_noise. The motion buckets' rope H/W:
+        # FramePacker projection kernels are (1,2,2), (2,4,4), (4,8,8) applied
+        # to motion latent slices of shape (B, C, F_bucket, H_lat, W_lat).
+        # After each conv the token grid is (F_bucket/kt, H_lat/kh, W_lat/kw).
+        # Phase 3 fix: previously this returned raw latent H/W under the
+        # assumption that rope_encode_comfy would internally divide, but MLX's
+        # rope_precompute_cos_sin_segments uses the shape as-is — so we return
+        # actual token-grid dimensions here.
         return [
-            (1, H_lat, W_lat),          # fine   proj kernel (1,2,2) → 1 frame
-            (1, H_lat // 2, W_lat // 2),  # medium proj_2x (2,4,4)   → 1 frame
-            (4, H_lat // 4, W_lat // 4),  # coarse proj_4x (4,8,8)   → 4 frames
+            (1, H_lat // 2, W_lat // 2),  # fine   proj kernel (1,2,2) → (1, H/2, W/2)
+            (1, H_lat // 4, W_lat // 4),  # medium proj_2x (2,4,4)     → (1, H/4, W/4)
+            (4, H_lat // 8, W_lat // 8),  # coarse proj_4x (4,8,8)     → (4, H/8, W/8)
         ]
 
     def prepare_rope_s2v(
