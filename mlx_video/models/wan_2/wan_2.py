@@ -6,7 +6,7 @@ import numpy as np
 
 from .attention import WanLayerNorm, _linear_dtype
 from .config import WanModelConfig
-from .rope import rope_params, rope_precompute_cos_sin
+from .rope import rope_params, rope_precompute_cos_sin, rope_precompute_cos_sin_segments
 from .transformer import WanAttentionBlock
 
 
@@ -510,6 +510,98 @@ class WanS2VModel(WanModel):
         )[None, :, :]
         return p + seg.astype(p.dtype), gs
 
+    def _motion_bucket_shapes(self, H_lat: int, W_lat: int) -> list:
+        """Return list of (F_seg, H_seg, W_seg) per motion bucket after patchify.
+
+        Matches FramePacker kernels: fine=(1,2,2), medium=(2,4,4), coarse=(4,8,8).
+        Given noise-slice grid (H_lat, W_lat) — the un-patchified motion latent
+        spatial dim is (H_lat * patch_h, W_lat * patch_w) since latent H/W is
+        the same as the noise latent's — the buckets project to::
+
+            fine   (1, H_lat, W_lat)          via (1,2,2)  → (1, H_lat/2, W_lat/2)  … wait
+            no:
+        Actually kijai calls ``rope_encode_comfy(1, lat_height, lat_width, ...)``
+        with ``steps_h/w`` overridden per bucket, where ``lat_height/width`` is
+        the un-patchified latent size. So the bucket H'/W' is::
+
+            fine   : (H_lat, W_lat)    // (2,2) -> H_lat/2, W_lat/2
+            medium : (H_lat, W_lat)    // (4,4) -> H_lat/4, W_lat/4
+            coarse : (H_lat, W_lat)    // (8,8) -> H_lat/8, W_lat/8
+
+        These MATCH the noise patch grid (H_noise = H_lat/2). So::
+
+            H_noise = H_lat / 2, W_noise = W_lat / 2
+            fine.h  = H_noise         = H_lat / 2
+            medium.h = H_lat / 4      = H_noise / 2
+            coarse.h = H_lat / 8      = H_noise / 4
+        """
+        # Motion buckets from the FramePacker output. Latent H/W == 2 * noise
+        # patch H/W (since patch kernel is (1,2,2)); we're given noise-grid H/W
+        # so H_lat = 2 * H_noise. The motion buckets' rope H/W:
+        return [
+            (1, H_lat, W_lat),          # fine   proj kernel (1,2,2) → 1 frame
+            (1, H_lat // 2, W_lat // 2),  # medium proj_2x (2,4,4)   → 1 frame
+            (4, H_lat // 4, W_lat // 4),  # coarse proj_4x (4,8,8)   → 4 frames
+        ]
+
+    def prepare_rope_s2v(
+        self,
+        noise_grid: tuple,
+        ref_grid: tuple | None = None,
+        motion_shapes: list | None = None,
+        dtype: mx.Dtype | None = None,
+    ) -> tuple:
+        """Precompute (cos, sin) for the S2V multi-segment sequence.
+
+        Segment order (verified against kijai ``forward``, model.py lines
+        2637-2734):
+
+            [noise (t=[0..F-1]),
+             ref   (t=[max(30, F+9) + i for i in F_ref]),
+             motion_fine   (t=[-1]),
+             motion_medium (t=[-3]),
+             motion_coarse (t=[-19..-16])]
+
+        Args:
+            noise_grid: (F, H, W) — noise latent patch grid.
+            ref_grid:   (F_ref, H_ref, W_ref) or None.
+            motion_shapes: list of (F_i, H_i, W_i) per bucket (fine, medium,
+                coarse) or None. Use :meth:`_motion_bucket_shapes` if you have
+                the raw latent H/W but not the bucket grids.
+            dtype: output dtype for cos/sin.
+
+        Returns:
+            (cos_f, sin_f) each of shape (seq_total, 1, half_d).
+        """
+        from .attention import _linear_dtype as _dt
+        if dtype is None:
+            dtype = _dt(self.patch_embedding_proj)
+
+        F, H, W = noise_grid
+        segments: list = [{"t_indices": list(range(F)), "h": H, "w": W}]
+
+        if ref_grid is not None:
+            F_ref, H_ref, W_ref = ref_grid
+            t_ref = max(30, F + 9)
+            segments.append(
+                {
+                    "t_indices": [t_ref + i for i in range(F_ref)],
+                    "h": H_ref,
+                    "w": W_ref,
+                }
+            )
+
+        if motion_shapes:
+            # kijai concat order: [fine (t=-1), medium (t=-3), coarse (t=-19..-16)].
+            motion_t_starts = [-1, -3, -19]
+            for (F_m, H_m, W_m), t_start in zip(motion_shapes, motion_t_starts):
+                t_indices = [t_start + i for i in range(F_m)]
+                segments.append(
+                    {"t_indices": t_indices, "h": H_m, "w": W_m}
+                )
+
+        return rope_precompute_cos_sin_segments(segments, self.freqs, dtype=dtype)
+
     def _time_embed_scalar(self, t: mx.array, batch_size: int) -> tuple:
         """Compute (e, e0): pre-projection ``e`` and block modulation ``e0``.
 
@@ -740,16 +832,33 @@ class WanS2VModel(WanModel):
                     audio_emb_global = audio_emb_global[:, :F_video]
 
         # ------------------------------------------------------------------
-        # 9. Run transformer blocks, injecting audio at selected layers.
+        # 9. RoPE for the full [noise, ref, motion] concatenated sequence.
         # ------------------------------------------------------------------
-        # Note: we deliberately reuse the T2V rope_cos_sin path only for the
-        # noise slice; ref/motion tokens skip RoPE in self-attention because
-        # they are appended *after* the noise slice and RoPE is applied per
-        # grid_sizes[i] which describes only the noise slice. Verified vs
-        # kijai (rope_encode_comfy, line 2703): ref RoPE uses t_start =
-        # max(30, F_video + 9), motion RoPE uses t_start = -1/-3/-19 for
-        # the post/2x/4x buckets. Full parity would require rebuilding
-        # rope_cos_sin with three concatenated temporal grids — deferred.
+        # If the caller pre-computed cos/sin covering only the noise slice
+        # (via WanModel.prepare_rope), we rebuild it here to cover ref+motion.
+        # This matches kijai's rope_encode_comfy (model.py lines 2210, 2704):
+        #   ref RoPE uses  t_start = max(30, F_video + 9)
+        #   motion RoPE uses t_start = -1 / -3 / -19 for fine/medium/coarse.
+        need_rebuild_rope = (
+            rope_cos_sin is None
+            or rope_cos_sin[0].shape[0] < seq_total
+        )
+        if need_rebuild_rope:
+            motion_shapes = None
+            if motion_token_list:
+                # Derive per-bucket (F', H', W') from the latent H/W (= 2 * H_grid).
+                H_lat = H_grid * self._patch_size[1]
+                W_lat = W_grid * self._patch_size[2]
+                motion_shapes = self._motion_bucket_shapes(H_lat, W_lat)
+            rope_cos_sin = self.prepare_rope_s2v(
+                noise_grid=(F_grid, H_grid, W_grid),
+                ref_grid=ref_grid if ref_tokens is not None else None,
+                motion_shapes=motion_shapes,
+                dtype=w_dtype,
+            )
+
+        # Padding within the noise slice (if any) still needs masking, but the
+        # multi-segment cos/sin already covers all real ref/motion tokens.
         kwargs = dict(
             e=e_block,
             seq_lens=[seq_total] * batch_size,

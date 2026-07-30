@@ -1030,15 +1030,23 @@ def generate_s2v_video(
         cross_kv = single_model.prepare_cross_kv(context_cfg)
     mx.eval(cross_kv)
 
-    # RoPE for the *noise* slice only; ref/motion tokens skip self-attn RoPE.
+    # Multi-segment RoPE: covers [noise, ref, motion] in a single (cos, sin)
+    # so ref gets t=max(30, F+9) and motion buckets t=-1/-3/-19. Verified
+    # against kijai wanvideo/modules/model.py::rope_encode_comfy (line 2705).
     f_grid = t_latent // patch_size[0]
     h_grid = h_latent // patch_size[1]
     w_grid = w_latent // patch_size[2]
-    rope_grid_sizes = (
-        [(f_grid, h_grid, w_grid)] if cfg_disabled
-        else [(f_grid, h_grid, w_grid)] * 2
+    # Reference latent grid: single frame at the same H_lat, W_lat.
+    ref_grid = (
+        (z_ref.shape[1], h_grid, w_grid) if z_ref is not None else None
     )
-    rope_cos_sin = single_model.prepare_rope(rope_grid_sizes)
+    # No motion history in first-clip talking-head generation.
+    motion_shapes = None
+    rope_cos_sin = single_model.prepare_rope_s2v(
+        noise_grid=(f_grid, h_grid, w_grid),
+        ref_grid=ref_grid,
+        motion_shapes=motion_shapes,
+    )
     mx.eval(rope_cos_sin)
 
     # Scheduler
