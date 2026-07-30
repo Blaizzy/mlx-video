@@ -1040,8 +1040,29 @@ def generate_s2v_video(
     ref_grid = (
         (z_ref.shape[1], h_grid, w_grid) if z_ref is not None else None
     )
-    # No motion history in first-clip talking-head generation.
-    motion_shapes = None
+    # First-clip motion history: kijai (nodes_sampler.py L2079-2124) trains with
+    # motion tokens ALWAYS present -- on the first clip the wrapper builds a
+    # zero pixel tensor of shape [1, 3, motion_frames=73, H, W], VAE-encodes it
+    # to ~19 latent frames, and feeds it as s2v_ref_motion. Passing None (as MLX
+    # did originally) puts the model OOD → visible warmup/luminance pulse in
+    # the first ~1 s of output. We supply an all-zero motion latent of the
+    # canonical 19-frame length; frame_packer.pack_motion_frames zero-pads if
+    # shorter (matches kijai's behaviour for black-frame history). We don't
+    # bother VAE-encoding zeros — the encoder's black-frame offset is small
+    # relative to the noise scheduler and doesn't visibly change first-clip
+    # stability.
+    zero_motion_latent = mx.zeros(
+        (1, config.vae_z_dim, 19, h_latent, w_latent), dtype=mx.float32
+    )
+    mx.eval(zero_motion_latent)
+
+    # RoPE now must cover motion segments too; derive their bucket shapes from
+    # the noise latent H/W (matches WanS2VModel._motion_bucket_shapes).
+    motion_shapes = [
+        (1, h_latent, w_latent),                # fine   -- proj (1,2,2)
+        (1, h_latent // 2, w_latent // 2),      # medium -- proj (2,4,4)
+        (4, h_latent // 4, w_latent // 4),      # coarse -- proj (4,8,8)
+    ]
     rope_cos_sin = single_model.prepare_rope_s2v(
         noise_grid=(f_grid, h_grid, w_grid),
         ref_grid=ref_grid,
@@ -1076,7 +1097,7 @@ def generate_s2v_video(
                 seq_len=seq_len,
                 audio_input=audio_feat,
                 ref_image_latent=z_ref,
-                motion_history_latent=None,
+                motion_history_latent=zero_motion_latent,
                 cross_kv_caches=cross_kv,
                 rope_cos_sin=rope_cos_sin,
             )
@@ -1093,7 +1114,7 @@ def generate_s2v_video(
                 seq_len=seq_len,
                 audio_input=audio_b,
                 ref_image_latent=z_ref,
-                motion_history_latent=None,
+                motion_history_latent=zero_motion_latent,
                 cross_kv_caches=cross_kv,
                 rope_cos_sin=rope_cos_sin,
             )
