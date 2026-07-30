@@ -1068,18 +1068,21 @@ def generate_s2v_video(
             f"must be divisible by 64). Try e.g. 448x256, 512x320, 640x384."
         )
 
-    # First-clip motion history: use VAE(zero-pixel) computed above. Previously
-    # we tried pure-zero latent which left ~4 frames of visible warmup because
-    # the VAE's learned black-frame offset is what the model actually expects.
-    zero_motion_latent = z_motion_history
+    # Motion history: kijai's non-framepack context-window path does NOT pass
+    # s2v_ref_motion to the model (nodes_sampler.py L2038: only s2v_audio_input,
+    # s2v_motion_frames=[1,0], s2v_pose passed — no ref_motion). Only the
+    # framepack loop path feeds a VAE-encoded motion buffer, and even THERE
+    # kijai explicitly drops the first 3 output pixel frames (line 2168:
+    # `if r == 0: image = image[:, :, 3:]`) — the very --trim-first-frames
+    # workaround we're forbidden.  For single-clip inference we therefore
+    # follow the non-framepack path and pass None: no motion tokens are added
+    # to the sequence and no warmup pulse can occur.  (The VAE(black) encode
+    # attempt at commit a43bd8e still left ~19 motion tokens biasing frame 0.)
+    zero_motion_latent = None
 
-    # RoPE covers motion segments; shapes are the TOKEN-grid dims after each
-    # FramePacker projection kernel (mirrors WanS2VModel._motion_bucket_shapes).
-    motion_shapes = [
-        (1, h_latent // 2, w_latent // 2),      # fine   -- proj (1,2,2)
-        (1, h_latent // 4, w_latent // 4),      # medium -- proj (2,4,4)
-        (4, h_latent // 8, w_latent // 8),      # coarse -- proj (4,8,8)
-    ]
+    # RoPE covers noise + ref only when motion is disabled. Motion shapes
+    # would be applied downstream *only* if motion_history_latent is not None.
+    motion_shapes = None
     rope_cos_sin = single_model.prepare_rope_s2v(
         noise_grid=(f_grid, h_grid, w_grid),
         ref_grid=ref_grid,

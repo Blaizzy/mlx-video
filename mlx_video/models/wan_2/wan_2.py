@@ -822,6 +822,15 @@ class WanS2VModel(WanModel):
         audio_emb = None
         audio_emb_global = None
         if audio_input is not None:
+            # kijai model.py L2419: prepend s2v_motion_frames[0]=1 copies of the
+            # first audio bucket before the causal encoder. For the non-framepack
+            # context-window path (our target), s2v_motion_frames=[1, 0], so we
+            # duplicate the first audio-time bucket once at the start. Without
+            # this, the causal conv's latent-frame 0 output is temporally
+            # shifted by ~1 audio tick relative to reference, producing an
+            # audible lipsync lag.
+            first_slice = audio_input[..., 0:1]
+            audio_input = mx.concatenate([first_slice, audio_input], axis=-1)
             enc_out = self.casual_audio_encoder(audio_input)
             if isinstance(enc_out, tuple):
                 audio_emb, audio_emb_global = enc_out
