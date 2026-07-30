@@ -366,14 +366,61 @@ def extract_wav2vec_features(
         hs = torch.stack(outputs.hidden_states, dim=1)  # (1, 25, T_wav, D)
         # Reshape to (1, 25, D, T_wav) for interp along the time axis.
         hs = hs.permute(0, 1, 3, 2)  # (1, 25, D, T_wav)
-
-        T_target = num_audio_token * num_video_frames
-        # F.interpolate expects (N, C, L) — collapse the layer axis into channels.
         B, L, D, T_wav = hs.shape
         hs_flat = hs.reshape(B, L * D, T_wav)
-        # Kijai (wanvideo/modules/s2v/audio_encoder.py linear_interpolation):
-        # F.interpolate(..., mode="linear", align_corners=True).
-        hs_flat = F.interpolate(hs_flat, size=T_target, mode="linear", align_corners=True)
-        hs = hs_flat.reshape(B, L, D, T_target)
+
+        # ------------------------------------------------------------------
+        # Audio temporal density fix (kijai bucketing) — replaces the naive
+        # "stretch to T_target across full audio" that was compressing the
+        # audio timeline (17.3 ticks/sec for a 3.1s clip instead of 16
+        # ticks/sec).  Kijai s2v/nodes.py L83-107 + wanvideo/modules/s2v/
+        # audio_encoder.py get_audio_embed_bucket_fps:
+        #   1) wav2vec native 50 fps  → linear-interp to 30 fps
+        #      (kijai linear_interpolation with align_corners=True)
+        #   2) Sample bucket_fps=16 ticks per second at time_points =
+        #      linspace(0, num_sample/16, num_sample, endpoint=False)
+        #      rounded to 30fps indices.  Indices past real audio →
+        #      silent (zero) fill.
+        # Effect: audio-latent frame f corresponds to video time exactly
+        # 4f/16 = 0.25f seconds — matching the video's 16fps latent grid
+        # (4 pixel frames per latent frame).  Previous naive interp caused
+        # up to 82ms audio-video drift on a 3s clip = 1.3 frames at 16fps.
+        # ------------------------------------------------------------------
+        WAV2VEC_FPS = 50   # native wav2vec-large feature rate
+        MID_FPS = 30       # kijai's 50->30 interpolation target
+        BUCKET_FPS = 16    # 16fps -> 4 audio ticks per latent frame
+
+        # Step 1: interp 50fps -> 30fps.  Output length = ceil(T_wav*30/50).
+        T_at_mid = int(round(T_wav * MID_FPS / WAV2VEC_FPS))
+        hs_mid = F.interpolate(
+            hs_flat, size=T_at_mid, mode="linear", align_corners=True,
+        )  # (1, L*D, T_at_mid)
+
+        # Step 2: sample num_audio_token * num_video_frames ticks at 16fps
+        # from t=0.  Match kijai's get_sample_indices with fixed_start=0.
+        T_target = num_audio_token * num_video_frames
+        time_points = np.linspace(
+            0.0, T_target / BUCKET_FPS, T_target, endpoint=False
+        )
+        frame_indices = np.round(time_points * MID_FPS).astype(int)
+        # Indices past real audio → silence (zero fill).  Match kijai
+        # (get_audio_embed_bucket_fps padding branch: `torch.zeros(...)`).
+        in_range_mask = frame_indices < T_at_mid
+        clamped = np.clip(frame_indices, 0, max(T_at_mid - 1, 0))
+
+        # Gather (B, L*D, T_target).
+        idx_t = torch.as_tensor(clamped, dtype=torch.long)
+        hs_sampled = hs_mid.index_select(-1, idx_t)  # (1, L*D, T_target)
+
+        # Zero out the padded (post-audio) ticks.
+        if not in_range_mask.all():
+            zero_mask = torch.as_tensor(
+                (~in_range_mask).astype(np.float32), dtype=hs_sampled.dtype
+            )
+            # broadcast (T_target,) -> (1, 1, T_target); multiply keeps only
+            # in-range ticks.
+            hs_sampled = hs_sampled * (1.0 - zero_mask)[None, None, :]
+
+        hs = hs_sampled.reshape(B, L, D, T_target)
 
     return mx.array(hs.cpu().numpy())
