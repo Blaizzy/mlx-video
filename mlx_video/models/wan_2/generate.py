@@ -808,6 +808,344 @@ def generate_video(
     print(f"{Colors.DIM}  Total time: {time.time() - t1:.1f}s{Colors.RESET}")
 
 
+def generate_s2v_video(
+    model_dir: str,
+    prompt: str,
+    image: str,
+    audio: str,
+    negative_prompt: str | None = None,
+    width: int = 512,
+    height: int = 512,
+    num_frames: int = 81,
+    steps: int | None = None,
+    guide_scale: float | tuple | None = None,
+    shift: float | None = None,
+    seed: int = -1,
+    output_path: str = "output_s2v.mp4",
+    scheduler: str = "unipc",
+    tiling: str = "auto",
+    no_compile: bool = False,
+):
+    """End-to-end Wan 2.2 Speech-to-Video generation.
+
+    Args:
+        model_dir: converted MLX S2V model directory (must contain
+            ``model.safetensors``, ``t5_encoder.safetensors``,
+            ``vae.safetensors``, ``config.json``).
+        prompt: text prompt describing the scene.
+        image: path to the reference (portrait) image.
+        audio: path to the driving audio (.wav, mono, 16 kHz preferred).
+        negative_prompt: passed to CFG. Defaults to the model's Chinese
+            negative prompt when None.
+        width/height: video resolution (aligned to VAE stride * patch).
+        num_frames: number of pixel frames to render (must be 4n+1).
+        steps: diffusion steps. Defaults to ``config.sample_steps``.
+        guide_scale: CFG scale. Defaults to ``config.sample_guide_scale``.
+        shift: flow-matching shift. Defaults to ``config.sample_shift``.
+        seed: RNG seed. -1 = random.
+        output_path: MP4 output path.
+        scheduler: 'unipc' | 'dpm++' | 'euler'.
+        tiling: VAE-decode tiling mode (see ``generate_video``).
+        no_compile: skip ``mx.compile`` on the transformer.
+
+    This function is untested end-to-end in the CI sandbox. Run on Mac to
+    produce an actual MP4. Known limitations tagged with ``TODO(verify)``:
+      * Ref-image RoPE position (design says index 30) is currently *not*
+        applied — appended tokens skip RoPE. First-frame results may show
+        artifacts until the ref-position RoPE is wired up.
+      * Motion-history / framepack is not passed by default here (talking
+        head first-clip case). Extend by adding a ``motion_history`` arg.
+    """
+    import json
+
+    from mlx_video.models.wan_2.config import WanModelConfig
+    from mlx_video.models.wan_2.scheduler import (
+        FlowDPMPP2MScheduler,
+        FlowMatchEulerScheduler,
+        FlowUniPCScheduler,
+    )
+    from mlx_video.models.wan_2.audio_encoder import extract_wav2vec_features
+
+    model_dir = Path(model_dir)
+
+    # ------ config ------
+    config_path = model_dir / "config.json"
+    quantization = None
+    if config_path.exists():
+        with open(config_path) as f:
+            cfg_dict = json.load(f)
+        quantization = cfg_dict.pop("quantization", None)
+        for k in (
+            "patch_size", "vae_stride", "window_size", "sample_guide_scale",
+            "audio_inject_layers",
+        ):
+            if k in cfg_dict and isinstance(cfg_dict[k], list):
+                cfg_dict[k] = tuple(cfg_dict[k])
+        config = WanModelConfig(
+            **{k: v for k, v in cfg_dict.items()
+               if k in WanModelConfig.__dataclass_fields__}
+        )
+    else:
+        config = WanModelConfig.wan22_s2v_14b()
+
+    if config.model_type != "s2v":
+        print(f"{Colors.YELLOW}  Overriding config.model_type='{config.model_type}' → 's2v'{Colors.RESET}")
+        config = WanModelConfig.wan22_s2v_14b()
+
+    if steps is None:
+        steps = config.sample_steps
+    if shift is None:
+        shift = config.sample_shift
+    if guide_scale is None:
+        guide_scale = config.sample_guide_scale
+    if isinstance(guide_scale, tuple):
+        cfg_disabled = all(gs <= 1.0 for gs in guide_scale)
+    else:
+        cfg_disabled = float(guide_scale) <= 1.0
+
+    if negative_prompt is None:
+        neg_prompt_resolved = config.sample_neg_prompt
+    else:
+        neg_prompt_resolved = negative_prompt
+
+    assert (num_frames - 1) % 4 == 0, f"num_frames must be 4n+1, got {num_frames}"
+
+    print(f"{Colors.CYAN}{'='*60}")
+    print(f"  Wan{config.model_version} Speech-to-Video (MLX, Phase-2)")
+    print(f"{'='*60}{Colors.RESET}")
+    print(f"{Colors.DIM}  Model dir: {model_dir}")
+    print(f"  Prompt: {prompt}")
+    print(f"  Ref image: {image}")
+    print(f"  Audio: {audio}")
+    print(f"  Size: {width}x{height}, Frames: {num_frames}")
+    print(f"  Steps: {steps}, Guide: {guide_scale}, Shift: {shift}{Colors.RESET}")
+
+    if seed < 0:
+        seed = random.randint(0, 2**32 - 1)
+    mx.random.seed(seed)
+    np.random.seed(seed)
+    print(f"{Colors.DIM}  Seed: {seed}{Colors.RESET}")
+
+    # Align dimensions.
+    vae_stride = config.vae_stride
+    patch_size = config.patch_size
+    align_h = patch_size[1] * vae_stride[1]
+    align_w = patch_size[2] * vae_stride[2]
+    if height % align_h != 0 or width % align_w != 0:
+        height = max(align_h, (height // align_h) * align_h)
+        width = max(align_w, (width // align_w) * align_w)
+        print(f"{Colors.DIM}  Aligned to {width}x{height}{Colors.RESET}")
+    if config.max_area > 0 and height * width > config.max_area:
+        width, height = _best_output_size(width, height, align_w, align_h, config.max_area)
+        print(f"{Colors.YELLOW}  Clamped to {width}x{height}{Colors.RESET}")
+
+    z_dim = config.vae_z_dim
+    t_latent = (num_frames - 1) // vae_stride[0] + 1
+    h_latent = height // vae_stride[1]
+    w_latent = width // vae_stride[2]
+    target_shape = (z_dim, t_latent, h_latent, w_latent)
+    seq_len = math.ceil((h_latent * w_latent) / (patch_size[1] * patch_size[2]) * t_latent)
+
+    # ------ text encoder ------
+    t1 = time.time()
+    print(f"\n{Colors.BLUE}Loading T5 encoder...{Colors.RESET}")
+    t5_path = model_dir / "t5_encoder.safetensors"
+    t5_encoder = load_t5_encoder(t5_path, config)
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained("google/umt5-xxl")
+    print(f"{Colors.BLUE}Encoding text...{Colors.RESET}")
+    context = encode_text(t5_encoder, tokenizer, prompt, config.text_len)
+    if cfg_disabled:
+        context_null = None
+        mx.eval(context)
+    else:
+        context_null = encode_text(t5_encoder, tokenizer, neg_prompt_resolved, config.text_len)
+        mx.eval(context, context_null)
+    del t5_encoder
+    gc.collect()
+    mx.clear_cache()
+    print(f"{Colors.DIM}  T5 encoding: {time.time() - t1:.1f}s{Colors.RESET}")
+
+    # ------ VAE encode reference image ------
+    print(f"\n{Colors.BLUE}Encoding reference image...{Colors.RESET}")
+    vae_path = model_dir / "vae.safetensors"
+    img_tensor = preprocess_image(image, width, height)  # (1, 1, H, W, 3)
+    mx.eval(img_tensor)
+    vae_enc = load_vae_encoder(vae_path, config)
+    z_ref = vae_enc.encode(img_tensor)  # (1, 1, H_lat, W_lat, z_dim)
+    mx.eval(z_ref)
+    # to (z_dim, 1, H_lat, W_lat)
+    z_ref = z_ref[0].transpose(3, 0, 1, 2)
+    del vae_enc, img_tensor
+    gc.collect()
+    mx.clear_cache()
+
+    # ------ wav2vec2 features ------
+    print(f"\n{Colors.BLUE}Extracting wav2vec2 features...{Colors.RESET}")
+    # Compute the video frames the S2V transformer sees (post-patchify F axis).
+    F_vid = t_latent // patch_size[0]
+    audio_feat = extract_wav2vec_features(
+        wav_path=audio,
+        num_video_frames=F_vid,
+        num_audio_token=config.num_audio_token,
+    )  # (1, 25, 1024, F_vid * num_audio_token)
+    mx.eval(audio_feat)
+
+    # ------ transformer ------
+    print(f"\n{Colors.BLUE}Loading S2V transformer...{Colors.RESET}")
+    t2 = time.time()
+    single_model = load_wan_model(
+        model_dir / "model.safetensors", config, quantization
+    )
+    print(f"{Colors.DIM}  Model loaded: {time.time() - t2:.1f}s{Colors.RESET}")
+
+    # Precompute text embeddings + cross-attn K/V.
+    if cfg_disabled:
+        context_emb = single_model.embed_text([context])
+        mx.eval(context_emb)
+        context_cond = context_emb[0:1]
+        cross_kv = single_model.prepare_cross_kv(context_cond)
+    else:
+        context_emb = single_model.embed_text([context, context_null])
+        mx.eval(context_emb)
+        context_cfg = mx.concatenate([context_emb[0:1], context_emb[1:2]], axis=0)
+        cross_kv = single_model.prepare_cross_kv(context_cfg)
+    mx.eval(cross_kv)
+
+    # RoPE for the *noise* slice only; ref/motion tokens skip self-attn RoPE.
+    f_grid = t_latent // patch_size[0]
+    h_grid = h_latent // patch_size[1]
+    w_grid = w_latent // patch_size[2]
+    rope_grid_sizes = (
+        [(f_grid, h_grid, w_grid)] if cfg_disabled
+        else [(f_grid, h_grid, w_grid)] * 2
+    )
+    rope_cos_sin = single_model.prepare_rope(rope_grid_sizes)
+    mx.eval(rope_cos_sin)
+
+    # Scheduler
+    _schedulers = {
+        "euler": FlowMatchEulerScheduler,
+        "dpm++": FlowDPMPP2MScheduler,
+        "unipc": FlowUniPCScheduler,
+    }
+    sched_cls = _schedulers.get(scheduler, FlowUniPCScheduler)
+    sched = sched_cls(num_train_timesteps=config.num_train_timesteps)
+    sched.set_timesteps(steps, shift=shift)
+
+    latents = mx.random.normal(target_shape)
+
+    # ------ diffusion loop ------
+    print(f"\n{Colors.GREEN}Denoising ({steps} steps)...{Colors.RESET}")
+    t3 = time.time()
+    timestep_list = sched.timesteps.tolist()
+    for i in tqdm(range(steps), desc="Diffusion"):
+        timestep_val = timestep_list[i]
+        if cfg_disabled:
+            t_batch = mx.array([timestep_val])
+            preds = single_model(
+                [latents],
+                t=t_batch,
+                context=context_cond,
+                seq_len=seq_len,
+                audio_input=audio_feat,
+                ref_image_latent=z_ref,
+                motion_history_latent=None,
+                cross_kv_caches=cross_kv,
+                rope_cos_sin=rope_cos_sin,
+            )
+            noise_pred = preds[0]
+        else:
+            t_batch = mx.array([timestep_val, timestep_val])
+            # Broadcast audio + ref to batch 2.
+            audio_b = mx.broadcast_to(audio_feat, (2,) + audio_feat.shape[1:])
+            gs = guide_scale if isinstance(guide_scale, (int, float)) else guide_scale[0]
+            preds = single_model(
+                [latents, latents],
+                t=t_batch,
+                context=context_cfg,
+                seq_len=seq_len,
+                audio_input=audio_b,
+                ref_image_latent=z_ref,
+                motion_history_latent=None,
+                cross_kv_caches=cross_kv,
+                rope_cos_sin=rope_cos_sin,
+            )
+            noise_pred_cond, noise_pred_uncond = preds[0], preds[1]
+            noise_pred = noise_pred_uncond + gs * (noise_pred_cond - noise_pred_uncond)
+
+        latents = sched.step(noise_pred[None], timestep_val, latents[None]).squeeze(0)
+        mx.eval(latents)
+    print(f"{Colors.DIM}  Denoising: {time.time() - t3:.1f}s{Colors.RESET}")
+
+    del single_model, cross_kv
+    gc.collect()
+    mx.clear_cache()
+
+    # ------ VAE decode ------
+    print(f"\n{Colors.BLUE}Decoding with VAE...{Colors.RESET}")
+    t4 = time.time()
+    vae = load_vae_decoder(vae_path, config)
+    from mlx_video.models.ltx_2.video_vae.tiling import TilingConfig
+    if tiling == "none":
+        tiling_config = None
+    elif tiling == "auto":
+        tiling_config = TilingConfig.auto(height, width, num_frames)
+    else:
+        tiling_config = TilingConfig.default()
+
+    if tiling_config is not None:
+        video = vae.decode_tiled(latents[None], tiling_config)
+    else:
+        video = vae.decode(latents[None])
+    mx.eval(video)
+    print(f"{Colors.DIM}  VAE decode: {time.time() - t4:.1f}s{Colors.RESET}")
+    video = np.array(video[0])  # (3, T', H, W)
+    video = (video + 1.0) / 2.0
+    video = np.clip(video * 255.0, 0, 255).astype(np.uint8)
+    video = video.transpose(1, 2, 3, 0)  # (T, H, W, 3)
+
+    save_video(video, output_path, fps=config.sample_fps)
+    print(f"\n{Colors.GREEN}✓ Video saved to {output_path}{Colors.RESET}")
+    print(f"{Colors.DIM}  Total time: {time.time() - t1:.1f}s{Colors.RESET}")
+
+
+def _dispatch_s2v(args):
+    """CLI entry point for Wan 2.2 S2V."""
+    guide_scale = None
+    if args.guide_scale is not None:
+        parts = [float(x) for x in args.guide_scale.split(",")]
+        guide_scale = tuple(parts) if len(parts) > 1 else parts[0]
+
+    neg_prompt = args.negative_prompt
+    if args.no_negative_prompt:
+        neg_prompt = ""
+
+    if not args.image:
+        raise ValueError("--image PATH is required for S2V (reference image).")
+    if not args.audio:
+        raise ValueError("--audio PATH is required for S2V (driving audio).")
+
+    generate_s2v_video(
+        model_dir=args.model_dir,
+        prompt=args.prompt,
+        image=args.image,
+        audio=args.audio,
+        negative_prompt=neg_prompt,
+        width=args.width,
+        height=args.height,
+        num_frames=args.num_frames,
+        steps=args.steps,
+        guide_scale=guide_scale,
+        shift=args.shift,
+        seed=args.seed,
+        output_path=args.output_path,
+        scheduler=args.scheduler,
+        tiling=args.tiling,
+        no_compile=args.no_compile,
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description="Wan Text-to-Video Generation (MLX)")
     parser.add_argument(
@@ -821,7 +1159,20 @@ def main():
         "--image",
         type=str,
         default=None,
-        help="Path to input image for I2V (omit for T2V mode)",
+        help="Path to input image for I2V or S2V reference image (omit for T2V mode)",
+    )
+    parser.add_argument(
+        "--audio",
+        type=str,
+        default=None,
+        help="Path to input audio (.wav) for S2V speech-to-video mode",
+    )
+    parser.add_argument(
+        "--model-type",
+        type=str,
+        default=None,
+        choices=["t2v", "i2v", "ti2v", "s2v"],
+        help="Override auto-detected model type (default: from config.json)",
     )
     parser.add_argument(
         "--negative-prompt",
@@ -948,6 +1299,13 @@ def main():
         if not lora_list:
             return None
         return [(path, float(strength)) for path, strength in lora_list]
+
+    # ---------- S2V dispatch ----------
+    # If user passed --audio or --model-type s2v, route to the S2V pipeline
+    # (Phase 1: loads the model, then raises NotImplementedError from forward).
+    if args.audio is not None or args.model_type == "s2v":
+        _dispatch_s2v(args)
+        return
 
     generate_video(
         model_dir=args.model_dir,

@@ -21,9 +21,12 @@ def load_wan_model(
                       If provided, creates QuantizedLinear stubs before loading.
         loras: Optional list of (lora_path, strength) tuples to apply.
     """
-    from mlx_video.models.wan_2.wan_2 import WanModel
+    from mlx_video.models.wan_2.wan_2 import WanModel, WanS2VModel
 
-    model = WanModel(config)
+    if getattr(config, "model_type", "t2v") == "s2v":
+        model = WanS2VModel(config)
+    else:
+        model = WanModel(config)
 
     if quantization:
         from mlx_video.models.wan_2.convert import _quantize_predicate
