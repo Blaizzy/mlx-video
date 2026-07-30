@@ -138,6 +138,13 @@ class MotionEncoder_tc(nn.Module):
         # auxi_blocks.py MotionEncoder_tc.__init__ line 62: `self.act = nn.SiLU()`).
         self.act = nn.SiLU()
 
+        # LayerNorms between each conv+act (elementwise_affine=False in kijai =>
+        # no state-dict keys, but still critical to keep magnitudes bounded).
+        # kijai auxi_blocks.py MotionEncoder_tc lines 55-77.
+        self.norm1 = nn.LayerNorm(hidden_dim // 4, eps=1e-6, affine=False)
+        self.norm2 = nn.LayerNorm(hidden_dim // 2, eps=1e-6, affine=False)
+        self.norm3 = nn.LayerNorm(hidden_dim, eps=1e-6, affine=False)
+
         if need_global:
             self.conv1_global = _CausalConv1dModule(
                 in_dim, hidden_dim // 4, kernel_size=3
@@ -153,25 +160,37 @@ class MotionEncoder_tc(nn.Module):
         """Compute local audio tokens.
 
         x_t: (B, T_audio, in_dim)
-        Returns: (B, F_video, num_heads, hidden_dim)
+        Returns: (B, F_video, num_heads + 1, hidden_dim)
+                 — num_heads + 1 because a learned padding token is appended.
         """
         B, T, _ = x_t.shape
         hd = self.hidden_dim
         nh = self.num_heads
         # conv1_local outputs (B, T, num_heads * hd/4).
         y = self.conv1_local(x_t, stride=1)
-        y = self.act(y)
         # Split num_heads into a batch-dim so conv2/conv3 act per-head.
-        # (B, T, num_heads, hd/4)
         y = y.reshape(B, T, nh, hd // 4)
         # (B, num_heads, T, hd/4) -> (B*num_heads, T, hd/4)
         y = y.transpose(0, 2, 1, 3).reshape(B * nh, T, hd // 4)
-        y = self.conv2(y, stride=2)  # (B*nh, T/2, hd/2)
+        y = self.norm1(y)
         y = self.act(y)
+
+        y = self.conv2(y, stride=2)  # (B*nh, T/2, hd/2)
+        y = self.norm2(y)
+        y = self.act(y)
+
         y = self.conv3(y, stride=2)  # (B*nh, T/4, hd)
+        y = self.norm3(y)
+        y = self.act(y)
+
         # Back to (B, F, num_heads, hd)
         F_out = y.shape[1]
         y = y.reshape(B, nh, F_out, hd).transpose(0, 2, 1, 3)
+
+        # Append learnable padding token along the num_heads dim.
+        # kijai: padding = self.padding_tokens.repeat(b, x.shape[1], 1, 1) → cat on dim=-2
+        pad = mx.broadcast_to(self.padding_tokens.astype(y.dtype), (B, F_out, 1, hd))
+        y = mx.concatenate([y, pad], axis=-2)  # (B, F_out, num_heads+1, hd)
         return y
 
     def _run_global(self, x_t: mx.array) -> mx.array:
@@ -180,13 +199,19 @@ class MotionEncoder_tc(nn.Module):
         x_t: (B, T_audio, in_dim)
         Returns: (B, F_video, 1, hidden_dim)
         """
-        B, T, _ = x_t.shape
         hd = self.hidden_dim
         y = self.conv1_global(x_t, stride=1)  # (B, T, hd/4)
+        y = self.norm1(y)
         y = self.act(y)
+
         y = self.conv2(y, stride=2)  # (B, T/2, hd/2)
+        y = self.norm2(y)
         y = self.act(y)
+
         y = self.conv3(y, stride=2)  # (B, T/4, hd)
+        y = self.norm3(y)
+        y = self.act(y)
+
         y = self.final_linear(y)  # (B, T/4, hd)
         return y[:, :, None, :]  # (B, F, 1, hd)
 

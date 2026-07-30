@@ -969,13 +969,16 @@ def generate_s2v_video(
     # ------ VAE encode reference image ------
     print(f"\n{Colors.BLUE}Encoding reference image...{Colors.RESET}")
     vae_path = model_dir / "vae.safetensors"
+    # preprocess_image returns channels-LAST (1, 1, H, W, 3), but WanVAE.encode
+    # expects channels-FIRST (B, 3, T=1, H, W). Transpose accordingly.
     img_tensor = preprocess_image(image, width, height)  # (1, 1, H, W, 3)
+    img_tensor = mx.transpose(img_tensor, (0, 4, 1, 2, 3))  # (1, 3, 1, H, W)
     mx.eval(img_tensor)
     vae_enc = load_vae_encoder(vae_path, config)
-    z_ref = vae_enc.encode(img_tensor)  # (1, 1, H_lat, W_lat, z_dim)
+    z_ref = vae_enc.encode(img_tensor)  # (1, z_dim, 1, H_lat, W_lat) channel-first
     mx.eval(z_ref)
     # to (z_dim, 1, H_lat, W_lat)
-    z_ref = z_ref[0].transpose(3, 0, 1, 2)
+    z_ref = z_ref[0]  # drop batch dim → (z_dim, 1, H_lat, W_lat)
     del vae_enc, img_tensor
     gc.collect()
     mx.clear_cache()
@@ -984,10 +987,25 @@ def generate_s2v_video(
     print(f"\n{Colors.BLUE}Extracting wav2vec2 features...{Colors.RESET}")
     # Compute the video frames the S2V transformer sees (post-patchify F axis).
     F_vid = t_latent // patch_size[0]
+    # Prefer the wav2vec2 bundled with the S2V checkpoint — those weights are
+    # 100x smaller magnitude than facebook/wav2vec2-large-xlsr-53 (which is the
+    # unfine-tuned base) and produce meaningful audio embeddings.
+    w2v_candidates = [
+        model_dir / "wav2vec2-large-xlsr-53-english",
+        model_dir.parent / "Wan2.2-S2V-14B" / "wav2vec2-large-xlsr-53-english",
+        Path.home() / "mlx-video/checkpoints/Wan2.2-S2V-14B/wav2vec2-large-xlsr-53-english",
+    ]
+    w2v_model_name = "jonatasgrosman/wav2vec2-large-xlsr-53-english"
+    for cand in w2v_candidates:
+        if cand.exists() and (cand / "config.json").exists():
+            w2v_model_name = str(cand)
+            break
+    print(f"{Colors.DIM}  wav2vec2: {w2v_model_name}{Colors.RESET}")
     audio_feat = extract_wav2vec_features(
         wav_path=audio,
         num_video_frames=F_vid,
         num_audio_token=config.num_audio_token,
+        model_name=w2v_model_name,
     )  # (1, 25, 1024, F_vid * num_audio_token)
     mx.eval(audio_feat)
 
