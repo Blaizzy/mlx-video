@@ -723,13 +723,19 @@ class WanS2VModel(WanModel):
             motion_token_list = self.frame_packer.pack_motion_frames(
                 motion_history_latent
             )
-            # Add motion segment embedding to each bucket.
+            # Add motion segment embedding to each bucket, and broadcast to
+            # batch_size (motion_history_latent is normally B=1 even under CFG).
             new_list = []
             for mt in motion_token_list:
                 seg = self.trainable_cond_mask.segment_embedding(
                     2, mt.shape[1], dtype=mt.dtype
                 )
-                new_list.append(mt + seg[None, :, :].astype(mt.dtype))
+                mt = mt + seg[None, :, :].astype(mt.dtype)
+                if mt.shape[0] != batch_size:
+                    mt = mx.broadcast_to(
+                        mt, (batch_size,) + mt.shape[1:]
+                    )
+                new_list.append(mt)
             motion_token_list = new_list
 
         # ------------------------------------------------------------------
