@@ -979,6 +979,21 @@ def generate_s2v_video(
     mx.eval(z_ref)
     # to (z_dim, 1, H_lat, W_lat)
     z_ref = z_ref[0]  # drop batch dim → (z_dim, 1, H_lat, W_lat)
+
+    # ------ VAE-encode black-frame motion history (first-clip warmup fix) ------
+    # Kijai (nodes_sampler.py L2079-2124) VAE-encodes torch.zeros pixel frames
+    # for the first-clip motion history, NOT pure-zero latent. VAE has a learned
+    # bias for solid-black that the model expects; feeding pure zeros left ~4
+    # frames of visible warmup. motion_frames_pixel=73 → 19 latent frames after
+    # temporal 4x downsample ((73-1)//4 + 1 = 19). Encode once while VAE is
+    # still on device, then delete.
+    motion_pixel_frames = 73
+    zeros_pixel = mx.zeros((1, 3, motion_pixel_frames, height, width), dtype=img_tensor.dtype)
+    mx.eval(zeros_pixel)
+    z_motion_history = vae_enc.encode(zeros_pixel)  # (1, 16, 19, H_lat, W_lat)
+    mx.eval(z_motion_history)
+    del zeros_pixel
+
     del vae_enc, img_tensor
     gc.collect()
     mx.clear_cache()
@@ -1053,21 +1068,10 @@ def generate_s2v_video(
             f"must be divisible by 64). Try e.g. 448x256, 512x320, 640x384."
         )
 
-    # First-clip motion history: kijai (nodes_sampler.py L2079-2124) trains with
-    # motion tokens ALWAYS present -- on the first clip the wrapper builds a
-    # zero pixel tensor of shape [1, 3, motion_frames=73, H, W], VAE-encodes it
-    # to ~19 latent frames, and feeds it as s2v_ref_motion. Passing None (as MLX
-    # did originally) puts the model OOD → visible warmup/luminance pulse in
-    # the first ~1 s of output. We supply an all-zero motion latent of the
-    # canonical 19-frame length; frame_packer.pack_motion_frames zero-pads if
-    # shorter (matches kijai's behaviour for black-frame history). We don't
-    # bother VAE-encoding zeros — the encoder's black-frame offset is small
-    # relative to the noise scheduler and doesn't visibly change first-clip
-    # stability.
-    zero_motion_latent = mx.zeros(
-        (1, config.vae_z_dim, 19, h_latent, w_latent), dtype=mx.float32
-    )
-    mx.eval(zero_motion_latent)
+    # First-clip motion history: use VAE(zero-pixel) computed above. Previously
+    # we tried pure-zero latent which left ~4 frames of visible warmup because
+    # the VAE's learned black-frame offset is what the model actually expects.
+    zero_motion_latent = z_motion_history
 
     # RoPE covers motion segments; shapes are the TOKEN-grid dims after each
     # FramePacker projection kernel (mirrors WanS2VModel._motion_bucket_shapes).
