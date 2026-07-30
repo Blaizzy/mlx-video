@@ -980,19 +980,10 @@ def generate_s2v_video(
     # to (z_dim, 1, H_lat, W_lat)
     z_ref = z_ref[0]  # drop batch dim → (z_dim, 1, H_lat, W_lat)
 
-    # ------ VAE-encode black-frame motion history (first-clip warmup fix) ------
-    # Kijai (nodes_sampler.py L2079-2124) VAE-encodes torch.zeros pixel frames
-    # for the first-clip motion history, NOT pure-zero latent. VAE has a learned
-    # bias for solid-black that the model expects; feeding pure zeros left ~4
-    # frames of visible warmup. motion_frames_pixel=73 → 19 latent frames after
-    # temporal 4x downsample ((73-1)//4 + 1 = 19). Encode once while VAE is
-    # still on device, then delete.
-    motion_pixel_frames = 73
-    zeros_pixel = mx.zeros((1, 3, motion_pixel_frames, height, width), dtype=img_tensor.dtype)
-    mx.eval(zeros_pixel)
-    z_motion_history = vae_enc.encode(zeros_pixel)  # (1, 16, 19, H_lat, W_lat)
-    mx.eval(z_motion_history)
-    del zeros_pixel
+    # (Deleted: dead VAE-encode-black-frames path.  Phase 3c set
+    # motion_history_latent=None because kijai's non-framepack context-window
+    # branch does not pass s2v_ref_motion.  Encoding 73 solid-black pixel
+    # frames took ~30s per run and was thrown away unused.)
 
     del vae_enc, img_tensor
     gc.collect()
@@ -1124,8 +1115,15 @@ def generate_s2v_video(
             noise_pred = preds[0]
         else:
             t_batch = mx.array([timestep_val, timestep_val])
-            # Broadcast audio + ref to batch 2.
-            audio_b = mx.broadcast_to(audio_feat, (2,) + audio_feat.shape[1:])
+            # Kijai (wanvideo/modules/model.py L2417-2418):
+            #   if is_uncond: s2v_audio_input = s2v_audio_input * 0
+            # The uncond forward MUST see zeroed audio so CFG guidance
+            # (cond - uncond) preserves the audio-driven direction. Without
+            # this, both halves of the CFG batch respond to the same audio
+            # and the delta loses its audio component => mouth motion decouples
+            # from phonemes (visible lipsync miss).
+            zero_audio = mx.zeros_like(audio_feat)
+            audio_b = mx.concatenate([audio_feat, zero_audio], axis=0)
             gs = guide_scale if isinstance(guide_scale, (int, float)) else guide_scale[0]
             preds = single_model(
                 [latents, latents],
