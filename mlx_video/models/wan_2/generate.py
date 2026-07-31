@@ -825,6 +825,7 @@ def generate_s2v_video(
     scheduler: str = "unipc",
     tiling: str = "auto",
     no_compile: bool = False,
+    audio_scale: float = 1.0,
 ):
     """End-to-end Wan 2.2 Speech-to-Video generation.
 
@@ -918,7 +919,8 @@ def generate_s2v_video(
     print(f"  Ref image: {image}")
     print(f"  Audio: {audio}")
     print(f"  Size: {width}x{height}, Frames: {num_frames}")
-    print(f"  Steps: {steps}, Guide: {guide_scale}, Shift: {shift}{Colors.RESET}")
+    print(f"  Steps: {steps}, Guide: {guide_scale}, Shift: {shift}")
+    print(f"  Audio scale: {audio_scale}{Colors.RESET}")
 
     if seed < 0:
         seed = random.randint(0, 2**32 - 1)
@@ -1111,6 +1113,7 @@ def generate_s2v_video(
                 motion_history_latent=zero_motion_latent,
                 cross_kv_caches=cross_kv,
                 rope_cos_sin=rope_cos_sin,
+                audio_scale=audio_scale,
             )
             noise_pred = preds[0]
         else:
@@ -1135,6 +1138,7 @@ def generate_s2v_video(
                 motion_history_latent=zero_motion_latent,
                 cross_kv_caches=cross_kv,
                 rope_cos_sin=rope_cos_sin,
+                audio_scale=audio_scale,
             )
             noise_pred_cond, noise_pred_uncond = preds[0], preds[1]
             noise_pred = noise_pred_uncond + gs * (noise_pred_cond - noise_pred_uncond)
@@ -1208,6 +1212,7 @@ def _dispatch_s2v(args):
         scheduler=args.scheduler,
         tiling=args.tiling,
         no_compile=args.no_compile,
+        audio_scale=args.audio_scale,
     )
 
 
@@ -1345,6 +1350,15 @@ def main():
         "--debug-latents",
         action="store_true",
         help="Print per-temporal-position latent statistics after denoising (diagnostic)",
+    )
+    parser.add_argument(
+        "--audio-scale",
+        type=float,
+        default=1.0,
+        help="S2V only: multiplier on the audio-cross-attn residual "
+        "(kijai parity, see model.py L707/797/855). Default 1.0. "
+        "Increase (e.g. 1.5, 2.5) to strengthen lipsync amplitude when the "
+        "mouth barely moves relative to phoneme count.",
     )
     args = parser.parse_args()
 

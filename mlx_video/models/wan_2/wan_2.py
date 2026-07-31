@@ -655,6 +655,7 @@ class WanS2VModel(WanModel):
         cross_kv_caches: list | None = None,
         rope_cos_sin: tuple | None = None,
         y=None,
+        audio_scale: float = 1.0,
     ) -> list:
         """S2V forward pass.
 
@@ -918,6 +919,7 @@ class WanS2VModel(WanModel):
                     F=F_video,
                     N=N_per_frame,
                     seq_orig=seq_orig,
+                    audio_scale=audio_scale,
                 )
 
         # ------------------------------------------------------------------

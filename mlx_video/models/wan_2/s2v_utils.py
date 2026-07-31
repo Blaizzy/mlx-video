@@ -150,6 +150,7 @@ class AudioInjector(nn.Module):
         F: int,
         N: int,
         seq_orig: int,
+        audio_scale: float = 1.0,
     ) -> mx.array:
         """Apply audio cross-attention + AdaLN residual to the video slice.
 
@@ -162,6 +163,13 @@ class AudioInjector(nn.Module):
             F: number of video frames.
             N: number of tokens per video frame.
             seq_orig: number of "noise" tokens = F * N (excluding ref/motion).
+            audio_scale: multiplier on the audio-cross-attn residual. Kijai
+                exposes this as a tunable at multiple injection sites
+                (wanvideo/modules/model.py lines 707, 797, 855:
+                ``x = x + audio_x * audio_scale``). Default 1.0 matches the
+                original AudioInjector_WAN. Increase to strengthen lipsync
+                amplitude when the mouth barely moves ("音檔講了 10 個字但嘴巴
+                只動了 3 下"); decrease to soften over-driven mouth motion.
 
         Returns:
             hidden_states with the first ``seq_orig`` slice updated.
@@ -193,7 +201,12 @@ class AudioInjector(nn.Module):
         residual = injector(x, audio_ctx)
 
         # Rearrange back and residual-add into the video slice only.
+        # Kijai: x = x + audio_x * audio_scale  (default 1.0). We keep the
+        # scale factored out so the compile graph is shape-identical to the
+        # pre-patch version when audio_scale == 1.0.
         residual = residual.reshape(B, F * N, D)
+        if audio_scale != 1.0:
+            residual = residual * audio_scale
         new_video = video_slice + residual.astype(video_slice.dtype)
         if seq_total > seq_orig:
             tail = hidden_states[:, seq_orig:, :]
