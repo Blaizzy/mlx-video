@@ -21,3 +21,4 @@ mlx-models/
 logs/
 mlx_video/models/qwen3_5_moe_escha/codebooks/layout_v2/*.pkl
 mlx_video/models/qwen3_5_moe_escha/codebooks/layout_v2/*.npz
+*.npz
