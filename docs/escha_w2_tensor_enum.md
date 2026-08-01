@@ -69,3 +69,14 @@ The Escha-W2 safetensors contain EXACTLY these per-projection tensors for the 80
 **No** `packed_codes` / `scale` / `transform_left` / `transform_right` / `a1` / `a2` tensors. The task description was speculative — the actual escha wheel API (see `escha/gptoss_experts.py`) uses (`code`, `rin`, `rout`, `s_in`, `s_out`) as documented in `docs/ESCHA_PORT_FEASIBILITY.md §1a`.
 
 The C op `torch.ops.escha.escham_reconstruct(code, in_features, out_features, K, cbA, mul1) -> Tensor` decodes `code` alone — the codebook lattice (`cbA_id=1`, K=2/3) is baked into `escha/_C.…so` as compile-time `.nv.constant0` data. **The codebook is NOT a per-weight safetensors tensor.** Route I's premise was wrong; the codebook lives in the .so and must be extracted (or its generator formula reverse-engineered) once.
+
+## Update (Route J extraction)
+
+Codebook extraction ran successfully on Modal A10G (14 min wall-clock, `modal_extract_v2.py`), producing `cb_K2.npy` and `cb_K3.npy` of shape `(65536, 32)` fp16. However the SPREAD PATTERN of the dequant is not the classical AQLM assumption (see `docs/ESCHA_PORT_FEASIBILITY.md §11`):
+
+- Perturbing ONE code position at index=1 changes 5 output rows × 2 output cols (not 1 row × 16 cols).
+- Row locations follow a `[4, 5, 11, 12, 13]` or `[6, 7, 13, 14, 15]` pattern (Hadamard-permutation-like), tile-shifted by the in-tile index.
+- Col locations shift by +3 per position within a K-slice, +4 between K-slices.
+- Superposition holds (`op(A+B) = op(A) + op(B) - baseline`), so the op IS linear across positions — but each entry projects into a structured multi-row / multi-col support, not a single length-16 vector.
+
+To finish native decode: either full-pattern re-extraction with per-index `[row_pattern, col_pattern]` capture + math derivation, OR (cheaper) pre-dequant all MoE weights on Modal and ship as an MLX-native bf16 checkpoint bypassing `escham_reconstruct`.

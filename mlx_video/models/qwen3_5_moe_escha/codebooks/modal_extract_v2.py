@@ -121,7 +121,7 @@ def run_all(gu_bytes: bytes, dn_bytes: bytes) -> str:
     w0 = op(p0, in_f, out_f, K, True, False).detach().cpu().numpy().astype(np.float32)
     for val in [1, 2, 3, 5, 8, 13, 100, 256, 1024, 4096, 32767, -1, -100, -32768]:
         p = torch.zeros(cshape, dtype=torch.int16, device=device)
-        p[0, 0, 0] = val
+        p[0, 0, 0] = np.int16(np.uint16(val & 0xFFFF)) if val >= 0 else np.int16(val)
         w = op(p, in_f, out_f, K, True, False).detach().cpu().numpy().astype(np.float32)
         d = w - w0
         linearity[str(val)] = {
@@ -179,7 +179,10 @@ def run_all(gu_bytes: bytes, dn_bytes: bytes) -> str:
         t0 = time.time()
         for i in range(1, 65536):
             p = torch.zeros(cshape, dtype=torch.int16, device=device)
-            p[0, 0, 0] = i
+            # torch int16 assign rejects values > 32767; convert i via numpy
+            # so 32768..65535 wrap to negative int16 (correct two's-complement
+            # for uint16 index into the codebook lookup).
+            p[0, 0, 0] = np.int16(np.uint16(i))
             w = op(p, in_f, out_f, K, True, False).detach().cpu().numpy().astype(np.float32)
             d = w - w0
             row_mask = np.any(np.abs(d) > 1e-6, axis=1)

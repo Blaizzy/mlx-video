@@ -479,3 +479,118 @@ checkpoint, 45 min writing `gated_deltanet.py`, 30 min writing tests and
 iterating on the cache-correctness assertion, 30 min composing `model.py`
 around the layer types, 15 min running the "Hello" smoke and writing this
 section.
+
+---
+
+## 11. Route J session — codebook extraction succeeded, dequant math still WRONG
+
+### 11a. Facts we now know
+
+Route I premise ("no codebook — all state is per-weight tensors") was WRONG.
+Verified against the actual escha wheel (`.escha_wheel_cache/…/escha/_C.so`):
+
+- The `.so` exports BOTH ops. Symbols demangle to:
+  - `escham_reconstruct(Tensor, long, long, long, bool, bool) -> Tensor` — 6
+    kernel specializations `escham_reconstruct_kernel<CB_ID:{0,1,2}, K:{2,3}>`.
+    Codebook is COMPILED IN as `.nv.constant0.*` sections. Escha-W2 uses
+    `cb_id=1, K=2/3`.
+  - `escha_dequant(Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, long, long,
+    long, long, Optional[Tensor], long) -> Tensor` — 6 tensors + 4 longs +
+    optional gain + block_size. Matches the signature the task caller wrote,
+    BUT this op takes explicit codebook tensors that Escha-W2's safetensors
+    don't contain — so this op is NOT what the model runs.
+- The safetensors contain only 3 tensors per MoE projection: `escha_code`
+  (int16), `escha_rin` (fp16), `escha_rout` (fp16). Plus 2 all-ones scales
+  we drop. Enumerated in `docs/escha_w2_tensor_enum.md`.
+- The actual `escham_reconstruct` op is CALLABLE on Modal A10G with this build
+  — decodes real gate_up / down codes to `(in_p, out_p)` fp16 with finite
+  values (max_abs 3.949, mean_abs ~0.94). So the op WORKS on the real weights.
+
+### 11b. The dequant math is NOT the classical AQLM lookup we implemented
+
+The existing `mlx_video/models/qwen3_5_moe_escha/eschamoe.py::escham_reconstruct`
+assumes: for each `(tile_row, tile_col)` block, each of K residual layers has
+16 int16 codes; each code indexes a length-16 fp16 vector; that vector fills
+one row's 16 cols of the tile; sum over K.
+
+Empirical probe on Modal (see `codebooks/reference_dump.pkl` and `modal_extract_v2.py`):
+- Perturbing ONE code position (0,0,0) with value=1 changes 5 output rows × 2
+  output cols — not 1 row × 16 cols as the AQLM interpretation predicts.
+- Positions map to specific 2-col patches within a tile that shift with the
+  in-K-slice offset (`+3 cols per +15 within K`, `+4 cols per K` step).
+- Rows come in patterns like `[4, 5, 11, 12, 13]` (+7 spacing) or `[6, 7, 13, 14, 15]`
+  — bit-reversal / Hadamard-permutation-shaped, NOT classical AQLM.
+- Superposition test (`op(A ⊕ B) = op(A) + op(B) - baseline`): err = 0.000000.
+  So the op IS linear across code positions — but the codebook is NOT a simple
+  `(65536, 16)` row-vector table.
+
+### 11c. Extraction that ran but only captured half the codebook
+
+`modal_extract_v2.py` swept `code[0,0,0]` over `0..65535` for K=2 and K=3 on
+A10G (~14 min wall-clock). Recorded `d[first_nz_row, :32]` per index — but
+that MISSES the multi-row spread structure. `escha_codebooks_v1.npz` produced
+by `postprocess_codebook.py` is layout-correct for the FILE FORMAT expected by
+the current eschamoe.py, but the DATA doesn't reproduce escham_reconstruct
+(verified: first-row L2 diff 1.16 vs Modal's real `w_bare[0]`; our whole-weight
+L2 is 1835 vs real max_abs of 3.9 — off by ~100x).
+
+### 11d. To finish: two viable paths
+
+**Option A — full-pattern extraction (2-4 hrs GPU + math)**:
+1. Modal probe with per-index capture of the full `[row_pattern, col_pattern]`
+   support — for each index, record ~10 fp16 values at the ~5×2 non-zero
+   locations. ~1.3 MB per K. Sweep at multiple positions within-tile /
+   K-slice to nail down the position→tile-offset map.
+2. Re-derive `escham_reconstruct` as `for each (i, j, k, p): add
+   pattern[code[i,j,p+16k]] to shifted-tile[(i, j)]` and verify against
+   Modal reference. Expected wall-clock: 2-4 hrs of new sweeps + iteration.
+
+**Option B — pre-dequantize the whole model on Modal (1-2 hrs GPU + $)**:
+1. On Modal A10G run `escham_reconstruct` on all 80 MoE projections × 256
+   experts, get bf16 dense `w_bare`. Total ~9 GB bf16.
+2. Also apply `t128(x * rin)` and post-`t128 * rout` transforms and fuse into
+   an already-decoded per-expert weight — get plain bf16 weights.
+3. Save as new MLX-native `.safetensors` (~35 GB uncompressed, well within
+   Mac unified memory).
+4. Wire straight into an mlx-lm-style Qwen3.5-MoE — no custom dequant needed.
+
+Option B is drastically simpler and lower risk. The tradeoff: loses the "keep
+codes packed, decode on-the-fly" memory story (Escha-W2's key selling point on
+24GB cards). But for a Mac port targeting M4 Max with 128GB unified memory,
+36GB bf16 weights are fine, and this ships correctness NOW.
+
+**Recommendation:** pursue Option B for the initial Mac port; treat
+Option A / native decode as a Phase 3 optimisation once correctness is proven.
+
+### 11e. Route J deliverables in this commit
+
+Landed on `escha-mlx-port`:
+- `docs/escha_w2_tensor_enum.md` — full enumeration of every safetensor tensor
+  grouped by parent projection, with dtypes and layer-0 shapes.
+- `mlx_video/models/qwen3_5_moe_escha/codebooks/modal_deep_probe.py` — probes
+  torch.ops.escha, records single-position spread patterns and real-weight
+  decode outputs.
+- `mlx_video/models/qwen3_5_moe_escha/codebooks/modal_extract_v2.py` — robust
+  Modal extraction pipeline. Runs detached with Modal Volume persistence
+  (survives local disconnect); `::submit` fires the extraction, `::fetch`
+  pulls the results back.
+- `mlx_video/models/qwen3_5_moe_escha/codebooks/postprocess_codebook.py` —
+  loads raw sweep output, prints spread/linearity summary, writes
+  `escha_codebooks_v1.npz` (has correct file format; DATA is incomplete —
+  see 11c).
+
+### 11f. What is NOT working
+
+- End-to-end forward with real experts (Steps 5-6 of Route J): dequant math
+  wrong → model would emit incoherent tokens. `PackedScaledExpertLinear`
+  should NOT be wired into the model in its current form.
+
+### 11g. Session wall-clock
+
+~4 hrs: 45 min investigating the .so + safetensors, 45 min setting up Modal +
+`modal_deep_probe.py`, 60 min waiting for the K=2 + K=3 sweeps on A10G (two
+retries: first hit `int16` overflow at value 32768, second hit local-client
+cancellation — third run with proper `nohup + PPID=1` detachment worked),
+30 min post-processing + testing against real reference, 30 min writing this
+section + updating docs.
+
