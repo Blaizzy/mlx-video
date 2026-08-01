@@ -1,23 +1,32 @@
 """escham_reconstruct + PackedScaledExpertLinear — the 2-bit AQLM decode.
 
-This is the single algorithmic hole in the Escha port: `escham_reconstruct`
-decodes a 3-D int16 code tensor into a dense fp16 weight matrix by looking
-each 16-bit index up in a fixed codebook lattice baked into the reference
-Linux .so. See docs/ESCHA_PORT_FEASIBILITY.md §5 for the extraction plan.
+WORLD-FIRST NON-ESCHA IMPLEMENTATION of the packed 2-bit format.
 
-Codebook file: mlx_video/models/qwen3_5_moe_escha/codebooks/escha_codebooks_v1.npz
-Expected layout after extraction (see codebooks/extract_codebooks.py):
-    cb_A_K2 : (65536, 16) fp16   — codebook 1 (default), K=2 slice
-    cb_A_K3 : (65536, 16) fp16   — codebook 1, K=3 slice
-    (codebooks B, C not needed for Escha-W2 which uses cb_id=1)
+Reverse-engineered from `torch.ops.escha.escham_reconstruct` via three Modal
+A10G probes (`codebooks/modal_op_audit.py`, `codebooks/modal_smart_probe.py`):
 
-If the codebook file is absent, escham_reconstruct raises with a pointer
-to the extraction script.
+1. Op signature: `escham_reconstruct(Tensor packed, int in_f, int out_f, int K,
+   bool cbA, bool mul1) -> Tensor(in_f, out_f) fp16`
+2. Op is EXACTLY LINEAR in code entries (superposition |diff|=0).
+3. Codebook is (bi, bj)-INVARIANT: the same code value at any block position
+   produces the same 16x16 delta, only offset by (bi*16, bj*16).
+4. Each (K, k_slot, v) triplet maps to a 16x16 dense block with ~5-9 nonzero
+   entries. The union-of-nonzero positions per (K, k_slot) is 10-15 (very
+   sparse), giving a compact codebook of ~120 MB total for K=2 and K=3.
+
+Decode formula:
+    w_bare[bi*16:(bi+1)*16, bj*16:(bj+1)*16]
+        = sum over k of place(cb[K, k, code[bi, bj, k]], positions[K, k])
+
+Codebook artifact: `codebooks/layout_v2/compact.pkl` produced by the smart
+prober on Modal A10G. Compact format:
+    K{2,3}_positions[k] : (n_nz, 2) int8  — (row, col) positions in the block
+    K{2,3}_values[k]    : (65536, n_nz) fp16 — cb values per code index
 """
 
 from __future__ import annotations
 
-import os
+import pickle
 from pathlib import Path
 
 import mlx.core as mx
@@ -26,28 +35,39 @@ import mlx.nn as nn
 from .transform import t128
 
 
-_CB_PATH = Path(__file__).parent / "codebooks" / "escha_codebooks_v1.npz"
-_CB_CACHE: dict[int, mx.array] = {}   # keyed by K
+_CB_PATH = Path(__file__).parent / "codebooks" / "layout_v2" / "compact.pkl"
+# Cache: keyed by (K, dtype) -> dense (k_max, 65536, 16, 16) mx.array codebook
+_CB_CACHE: dict[tuple[int, str], mx.array] = {}
 
 
-def _load_codebook(K: int) -> mx.array:
-    """Load codebook for the given K slice. Cached across calls."""
-    if K in _CB_CACHE:
-        return _CB_CACHE[K]
+def _load_codebook_dense(K: int, dtype: mx.Dtype = mx.bfloat16) -> mx.array:
+    """Load the codebook for K in {2, 3}, densified to (k_max, 65536, 16, 16).
+
+    Storage cost (dense): K=2 → 32 × 65536 × 256 × 2 B = 1.07 GB fp16.
+                         K=3 → 48 × 65536 × 256 × 2 B = 1.61 GB fp16.
+    Held on-device (unified memory) for zero-copy lookups. Cached across calls.
+    """
+    key = (K, str(dtype))
+    if key in _CB_CACHE:
+        return _CB_CACHE[key]
     if not _CB_PATH.exists():
         raise FileNotFoundError(
-            f"Escha codebook not found at {_CB_PATH}.\n"
-            f"Run: python -m mlx_video.models.qwen3_5_moe_escha.codebooks.extract_codebooks\n"
-            f"on a Linux x86-64 box with the escha wheel installed. See\n"
-            f"docs/ESCHA_PORT_FEASIBILITY.md §5b for the one-shot extraction procedure."
+            f"Escha packed codebook not found at {_CB_PATH}.\n"
+            f"Run: modal run mlx_video/models/qwen3_5_moe_escha/codebooks/modal_smart_probe.py\n"
+            f"(requires the escha wheel + a CUDA GPU; ~1024 op calls, ~2 min A10G)."
         )
     import numpy as np
-    data = np.load(_CB_PATH)
-    key = f"cb_A_K{K}"
-    if key not in data.files:
-        raise KeyError(f"Codebook {key} missing from {_CB_PATH} (found: {data.files})")
-    cb = mx.array(data[key])   # (65536, 16) fp16
-    _CB_CACHE[K] = cb
+    with open(_CB_PATH, "rb") as f:
+        data = pickle.load(f)
+    positions = data[f"K{K}_positions"]      # list of (n_nz, 2) int8
+    values = data[f"K{K}_values"]            # list of (65536, n_nz) fp16
+    k_max = len(positions)
+    dense = np.zeros((k_max, 65536, 16, 16), dtype=np.float16)
+    for k, (pos, val) in enumerate(zip(positions, values)):
+        for i, (r, c) in enumerate(pos):
+            dense[k, :, r, c] = val[:, i]
+    cb = mx.array(dense).astype(dtype)
+    _CB_CACHE[key] = cb
     return cb
 
 
@@ -59,51 +79,58 @@ def escham_reconstruct(
     cb_id: int = 1,
     mul1: bool = False,
 ) -> mx.array:
-    """Decode packed AQLM codes to a dense fp16 weight matrix.
+    """Decode packed 2-bit Escha codes to a dense fp16 weight matrix.
 
     Args:
-        code: int16 (or uint16 view) of shape (in_features/16, out_features/16, 16*K).
+        code: int16 of shape (in_features/16, out_features/16, 16*K).
         in_features, out_features: padded dims (in_p, out_p). Escha-W2 has no padding.
         K: residual depth (2 for gate_up, 3 for down).
-        cb_id: codebook variant — always 1 for Escha-W2 (cbA).
-        mul1: multiplicative-1 flag — false for Escha-W2. When true the decoded
-              weights are multiplied by an implicit factor of 1 (documented as
-              a no-op in the reference; kept for schema parity).
+        cb_id: codebook variant — always 1 for Escha-W2 (cbA); other values would
+               swap the codebook and are not implemented (unused in the model).
+        mul1: unused; kept for schema parity with the reference op signature.
 
     Returns:
         fp16 tensor of shape (in_features, out_features).
 
-    Correctness model (matches escha_aqlm_gemv semantics):
-        For each 16-row × 16-col block indexed by (bi, bj), and for each residual
-        layer k ∈ [0, K):
-            idx = code[bi, bj, k*16 : (k+1)*16]                       # (16,) uint16
-            block[k, row, :] = codebook[cb_id, K, idx[row]]             # (16,)
-        Final block = sum over k. Assemble all blocks back into (in, out).
+    Algorithm:
+        cb has shape (k_max, 65536, 16, 16). For each (bi, bj, k):
+            block[bi*16:(bi+1)*16, bj*16:(bj+1)*16] += cb[k, code[bi,bj,k]]
+        Vectorized via a single `mx.take` per k_slot (or one gather over all k).
     """
     if cb_id != 1:
         raise NotImplementedError(f"Only cb_id=1 (Escha-W2 default) supported; got {cb_id}")
-    if code.shape[-1] != 16 * K:
-        raise ValueError(f"code last dim {code.shape[-1]} != 16*K={16*K}")
-    if code.shape[0] * 16 != in_features:
-        raise ValueError(f"code.shape[0]*16 = {code.shape[0]*16} != in_features {in_features}")
-    if code.shape[1] * 16 != out_features:
-        raise ValueError(f"code.shape[1]*16 = {code.shape[1]*16} != out_features {out_features}")
+    k_max = 16 * K
+    if code.shape[-1] != k_max:
+        raise ValueError(f"code last dim {code.shape[-1]} != 16*K={k_max}")
+    bi_max = in_features // 16
+    bj_max = out_features // 16
+    if code.shape[0] != bi_max:
+        raise ValueError(f"code.shape[0]={code.shape[0]} != in_features/16={bi_max}")
+    if code.shape[1] != bj_max:
+        raise ValueError(f"code.shape[1]={code.shape[1]} != out_features/16={bj_max}")
 
-    cb = _load_codebook(K)                                              # (65536, 16) fp16
-    # int16 → uint16 → int32 for gather. mx.take needs an integer index.
-    codes = code.reshape(in_features // 16, out_features // 16, K, 16)  # (bi, bj, k, row)
-    # Reinterpret signed int16 as unsigned via masking:
-    idx = codes.astype(mx.int32) & 0xFFFF                                # 0..65535
-    # Gather: for each (bi, bj, k, row) fetch codebook[idx][:] → (bi, bj, k, row, 16)
-    gathered = mx.take(cb, idx, axis=0)
-    # Sum over K (residual reconstruction).
-    per_block = gathered.sum(axis=2)                                     # (bi, bj, row, 16_col)
-    # Reassemble: (bi, bj, row, col_in_block) → (in_features, out_features).
-    # bi indexes rows of 16; bj indexes cols of 16.
-    per_block = per_block.transpose(0, 2, 1, 3)                          # (bi, row, bj, col)
+    cb = _load_codebook_dense(K, dtype=mx.bfloat16)   # (k_max, 65536, 16, 16) bf16
+
+    # Reinterpret int16 → uint16 index in [0, 65536).
+    idx = (code.astype(mx.int32) & 0xFFFF)             # (bi, bj, k_max)
+    # Per-k gather: for each k, cb[k] is (65536, 16, 16). We index with idx[:,:,k]
+    # to get (bi, bj, 16, 16) blocks. Do this for all k, then sum on k axis.
+    # Vectorized via advanced indexing on axis 0 = k, axis 1 = code index.
+    # We build shape-(k_max, bi_max, bj_max) index of code-value pairs, then
+    # gather (16, 16) blocks -> (k_max, bi_max, bj_max, 16, 16) -> sum over k
+    # -> (bi_max, bj_max, 16, 16) -> transpose to (bi, 16, bj, 16) -> reshape.
+    idx_k_major = idx.transpose(2, 0, 1)               # (k, bi, bj)
+    # cb: (k, 65536, 16, 16). Gather cb[k, idx_k_major[k]] for each k.
+    # mx.take_along_axis needs same-rank; simpler: reshape+gather manually.
+    # We compute:  blocks[k, bi, bj] = cb[k, idx_k_major[k, bi, bj]]
+    # by flattening (k, code) to a single dimension.
+    flat_cb = cb.reshape(k_max * 65536, 16, 16)
+    flat_idx = (mx.arange(k_max, dtype=mx.int32) * 65536).reshape(k_max, 1, 1) + idx_k_major
+    blocks = mx.take(flat_cb, flat_idx, axis=0)        # (k, bi, bj, 16, 16)
+    per_block = blocks.sum(axis=0)                     # (bi, bj, 16, 16)
+    # Reassemble: (bi, 16, bj, 16) -> (in, out)
+    per_block = per_block.transpose(0, 2, 1, 3)        # (bi, 16, bj, 16)
     w = per_block.reshape(in_features, out_features)
-    if mul1:
-        pass   # documented as identity in the reference for cb_id=1
     return w.astype(mx.float16)
 
 

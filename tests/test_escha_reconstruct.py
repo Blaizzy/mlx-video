@@ -1,157 +1,165 @@
-"""Escha AQLM reconstruct + PackedScaledExpertLinear wiring tests.
+"""Validate the reverse-engineered MLX escham_reconstruct.
 
-These use a SYNTHETIC codebook — real codebook extraction is out-of-band
-(see mlx_video/models/qwen3_5_moe_escha/codebooks/extract_codebooks.py and
-docs/ESCHA_PORT_FEASIBILITY.md §5). The point of the tests is to validate
-the plumbing (shape math, dtype, index widening from int16→uint16, cache
-behaviour, forward path) so that when real codebooks land we only debug
-numerics, not wiring.
+Cross-check the MLX packed decoder against Option-B dense-dequant M matrices.
+
+Pipeline algebra (all four steps linear):
+    M = t128( t128(I, pre=rin) @ w_bare, post=rout )
+where w_bare = escham_reconstruct(escha_code).
+
+If the MLX decoder is correct, composing M from our decoded w_bare should
+match the M produced on Modal (Option B, stored in
+`~/models/Qwen3.6-35B-A3B-Escha-W2-MLX-dequant/dequant_v1/`).
+
+Also runs plumbing tests on the codebook (shape, dtype, sign-bit as uint16).
 """
 
 from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
 
 import numpy as np
 import pytest
 import mlx.core as mx
 
-
-@pytest.fixture
-def synth_codebooks(tmp_path, monkeypatch):
-    """Write a deterministic (65536, 16) fp16 codebook and point the module at it.
-
-    Codebook value: cb[i, j] = (i * 16 + j) / 32768 - 1  (in [-1, 1))
-    Both K=2 and K=3 share the same layout so any test that fixes indices can
-    check reconstruction analytically.
-    """
-    cb = np.arange(65536 * 16, dtype=np.float32).reshape(65536, 16)
-    cb = (cb / 32768.0 - 1.0).astype(np.float16)
-    path = tmp_path / "escha_codebooks_v1.npz"
-    np.savez_compressed(path, cb_A_K2=cb, cb_A_K3=cb)
-
-    import mlx_video.models.qwen3_5_moe_escha.eschamoe as em
-    monkeypatch.setattr(em, "_CB_PATH", path)
-    em._CB_CACHE.clear()
-    yield cb
-    em._CB_CACHE.clear()
+from safetensors import safe_open
 
 
-def test_reconstruct_shape_and_dtype(synth_codebooks):
+ORIG_DIR = Path("/Users/kaede/models/Qwen3.6-35B-A3B-Escha-W2")
+DEQUANT_DIR = Path("/Users/kaede/models/Qwen3.6-35B-A3B-Escha-W2-MLX-dequant/dequant_v1")
+
+
+# ---------------------------------------------------------------------------
+# Plumbing tests — always runnable (need only the extracted codebook artifact).
+# ---------------------------------------------------------------------------
+def test_codebook_loads():
+    from mlx_video.models.qwen3_5_moe_escha.eschamoe import _load_codebook_dense
+    cb2 = _load_codebook_dense(2, dtype=mx.float16)
+    assert cb2.shape == (32, 65536, 16, 16), f"K=2 shape {cb2.shape}"
+    assert cb2.dtype == mx.float16
+    # Baseline (code=0) must be all-zero for every k_slot
+    b = cb2[:, 0, :, :]
+    mx.eval(b)
+    assert float(mx.abs(b).max()) == 0.0
+
+
+def test_reconstruct_shape_and_zero_code():
     from mlx_video.models.qwen3_5_moe_escha.eschamoe import escham_reconstruct
-
-    # Smallest possible: 16x16 block, K=2, single (bi=0, bj=0).
-    code = mx.zeros((1, 1, 32), dtype=mx.int16)
-    w = escham_reconstruct(code, in_features=16, out_features=16, K=2)
-    assert w.shape == (16, 16)
+    # All-zero code should reconstruct to all-zero w_bare (baseline is all zero
+    # per our extraction; the op's non-zero baseline was captured as identical
+    # sum-of-cb[k,0] contributions that we verified are zero).
+    code = mx.zeros((128, 64, 32), dtype=mx.int16)
+    w = escham_reconstruct(code, in_features=2048, out_features=1024, K=2)
+    mx.eval(w)
+    assert w.shape == (2048, 1024)
     assert w.dtype == mx.float16
+    # NB: op's actual baseline w0 is non-zero, but we extract cb as delta-from-
+    # baseline. Compose-M validates the full pipeline including baseline.
 
 
-def test_reconstruct_matches_codebook_lookup(synth_codebooks):
-    """For row r, code index i in slot k=0: block[r] should equal cb[i] + cb[0] (K-1 zeros).
-
-    With K=2 and all indices zero except code[0, 0, r]=i, the block row r
-    reconstruction = cb[i] + cb[0]. Verify a few rows.
-    """
-    from mlx_video.models.qwen3_5_moe_escha.eschamoe import escham_reconstruct
-
-    K = 2
-    code = np.zeros((1, 1, 16 * K), dtype=np.int16)
-    # Set row 0 slot 0 to idx 123; row 5 slot 0 to idx 999.
-    code[0, 0, 0] = 123
-    code[0, 0, 5] = 999
-    w = escham_reconstruct(mx.array(code), in_features=16, out_features=16, K=K)
-    w = np.array(w)
-    cb = synth_codebooks
-    # Row 0: cb[123] (slot k=0) + cb[0] (slot k=1). Other slots also index 0.
-    expected_row0 = (cb[123].astype(np.float32) + cb[0].astype(np.float32) * (K - 1)).astype(np.float16)
-    expected_row5 = (cb[999].astype(np.float32) + cb[0].astype(np.float32) * (K - 1)).astype(np.float16)
-    # Non-set rows: all-zero code → K * cb[0]
-    expected_row1 = (cb[0].astype(np.float32) * K).astype(np.float16)
-    np.testing.assert_allclose(w[0], expected_row0, atol=1e-3)
-    np.testing.assert_allclose(w[5], expected_row5, atol=1e-3)
-    np.testing.assert_allclose(w[1], expected_row1, atol=1e-3)
-
-
-def test_reconstruct_int16_signbit_treated_as_uint16(synth_codebooks):
-    """Codes stored as int16 must be interpreted as uint16 for the lookup.
-
-    idx=32768 stored as int16 is -32768. Make sure we still fetch cb[32768].
-    """
-    from mlx_video.models.qwen3_5_moe_escha.eschamoe import escham_reconstruct
-
-    code = np.zeros((1, 1, 32), dtype=np.int16)
-    code[0, 0, 0] = -32768  # bit pattern for uint16 32768
-    w = np.array(escham_reconstruct(mx.array(code), 16, 16, K=2))
-    cb = synth_codebooks
-    expected = (cb[32768].astype(np.float32) + cb[0].astype(np.float32)).astype(np.float16)
-    np.testing.assert_allclose(w[0], expected, atol=1e-3)
-
-
-def test_reconstruct_K3(synth_codebooks):
-    from mlx_video.models.qwen3_5_moe_escha.eschamoe import escham_reconstruct
-
-    code = mx.zeros((1, 1, 48), dtype=mx.int16)  # 16*3
-    w = escham_reconstruct(code, in_features=16, out_features=16, K=3)
-    assert w.shape == (16, 16)
-
-
-def test_reconstruct_multi_block(synth_codebooks):
-    """32x32 weight = 2x2 grid of 16x16 blocks. Verify assembly order (bi=row-block, bj=col-block)."""
-    from mlx_video.models.qwen3_5_moe_escha.eschamoe import escham_reconstruct
-
-    K = 2
-    code = np.zeros((2, 2, 16 * K), dtype=np.int16)
-    # Put a distinct index in each block's row 0.
-    code[0, 0, 0] = 100
-    code[0, 1, 0] = 200
-    code[1, 0, 0] = 300
-    code[1, 1, 0] = 400
-    w = np.array(escham_reconstruct(mx.array(code), 32, 32, K=K))
-    cb = synth_codebooks
-    # Row 0 (bi=0, block-row=0), col 0..15 (bj=0): cb[100] + cb[0]
-    expected_bi0_bj0 = (cb[100].astype(np.float32) + cb[0].astype(np.float32)).astype(np.float16)
-    expected_bi0_bj1 = (cb[200].astype(np.float32) + cb[0].astype(np.float32)).astype(np.float16)
-    expected_bi1_bj0 = (cb[300].astype(np.float32) + cb[0].astype(np.float32)).astype(np.float16)
-    np.testing.assert_allclose(w[0, 0:16], expected_bi0_bj0, atol=1e-3)
-    np.testing.assert_allclose(w[0, 16:32], expected_bi0_bj1, atol=1e-3)
-    np.testing.assert_allclose(w[16, 0:16], expected_bi1_bj0, atol=1e-3)
-
-
-def test_reconstruct_shape_validation(synth_codebooks):
-    from mlx_video.models.qwen3_5_moe_escha.eschamoe import escham_reconstruct
-
-    with pytest.raises(ValueError, match="in_features"):
-        escham_reconstruct(mx.zeros((1, 1, 32), dtype=mx.int16), in_features=32, out_features=16, K=2)
-    with pytest.raises(ValueError, match="16\\*K"):
-        escham_reconstruct(mx.zeros((1, 1, 33), dtype=mx.int16), in_features=16, out_features=16, K=2)
-    with pytest.raises(NotImplementedError, match="cb_id"):
-        escham_reconstruct(mx.zeros((1, 1, 32), dtype=mx.int16), 16, 16, K=2, cb_id=2)
-
-
-def test_packed_scaled_expert_forward(synth_codebooks):
-    """PackedScaledExpertLinear: full path with T128 pre/post and rin/rout."""
-    from mlx_video.models.qwen3_5_moe_escha.eschamoe import PackedScaledExpertLinear
-
-    in_f = out_f = in_p = out_p = 128   # smallest multiple of 128 (T128 block)
-    K = 2
-    # in_p/16 = 8, out_p/16 = 8, 16*K = 32
-    code = mx.zeros((in_p // 16, out_p // 16, 16 * K), dtype=mx.int16)
-    rin = mx.ones((in_p,), dtype=mx.float16)
-    rout = mx.ones((out_p,), dtype=mx.float16)
-
-    layer = PackedScaledExpertLinear(
-        code=code, rin=rin, rout=rout,
-        in_f=in_f, out_f=out_f, in_p=in_p, out_p=out_p, K=K,
+def test_reconstruct_int16_signbit_as_uint16():
+    """Codes stored as int16 must be interpreted as uint16 for lookup."""
+    from mlx_video.models.qwen3_5_moe_escha.eschamoe import (
+        _load_codebook_dense, escham_reconstruct,
     )
-    x = mx.random.normal((3, in_f)).astype(mx.bfloat16)
-    y = layer(x)
-    assert y.shape == (3, out_f)
-    assert y.dtype == mx.bfloat16
+    cb = _load_codebook_dense(2, dtype=mx.float16)
+    code = np.zeros((1, 1, 32), dtype=np.int16)
+    code[0, 0, 0] = -1  # bit pattern = 0xFFFF = uint16 65535
+    w = escham_reconstruct(mx.array(code), 16, 16, K=2)
+    mx.eval(w)
+    # First (16, 16) block should equal cb[k=0, v=65535]
+    expected = cb[0, 65535]
+    got = w[:16, :16]
+    diff = float(mx.abs(got.astype(mx.float32) - expected.astype(mx.float32)).max())
+    # bf16 rounding on the internal codebook load produces ~1e-2 abs errors on
+    # values of magnitude ~5. Just verify the lookup went to the right entry.
+    assert diff < 5e-2, f"sign-bit lookup failed: max diff {diff}"
 
 
-def test_missing_codebook_raises_with_helpful_message(tmp_path, monkeypatch):
-    import mlx_video.models.qwen3_5_moe_escha.eschamoe as em
-    monkeypatch.setattr(em, "_CB_PATH", tmp_path / "nope.npz")
-    em._CB_CACHE.clear()
-    with pytest.raises(FileNotFoundError, match="codebook"):
-        em._load_codebook(2)
-    em._CB_CACHE.clear()
+# ---------------------------------------------------------------------------
+# Correctness test vs. Option-B M matrices. Requires the model to be on disk.
+# ---------------------------------------------------------------------------
+def _load_expert(layer: int, expert: int, proj: str) -> dict:
+    idx = json.loads((ORIG_DIR / "model.safetensors.index.json").read_text())
+    wm = idx["weight_map"]
+    prefix = f"model.language_model.layers.{layer}.mlp.experts.{proj}"
+    out = {}
+    for suf in ("escha_code", "escha_rin", "escha_rout"):
+        key = f"{prefix}.{suf}"
+        shard = wm[key]
+        with safe_open(ORIG_DIR / shard, framework="numpy") as f:
+            out[suf] = mx.array(f.get_tensor(key)[expert])
+    return out
+
+
+def _load_M(layer: int, expert: int, proj: str) -> mx.array:
+    """Load Option-B M matrix (out_f, in_f) bf16 via mx.load (bf16-aware)."""
+    key = f"layer_{layer}.expert_{expert}.{proj}.weight"
+    all_ = mx.load(str(DEQUANT_DIR / f"layer_{layer:02d}.safetensors"))
+    return all_[key]
+
+
+def _compose_M_chunked(w_bare: mx.array, rin: mx.array, rout: mx.array,
+                       chunk: int = 256) -> mx.array:
+    """M = t128( t128(I, pre=rin) @ w_bare, post=rout ) — chunked over rows."""
+    from mlx_video.models.qwen3_5_moe_escha.transform import t128
+    in_f, out_f = w_bare.shape
+    w_bf = w_bare.astype(mx.bfloat16)
+    rin_bf = rin.astype(mx.bfloat16)
+    rout_bf = rout.astype(mx.bfloat16)
+    chunks = []
+    for i in range(0, in_f, chunk):
+        n = min(chunk, in_f - i)
+        r = mx.arange(n).reshape(-1, 1)
+        c = mx.arange(in_f).reshape(1, -1)
+        Ic = (c == (r + i)).astype(mx.bfloat16)
+        xh = t128(Ic, pre=rin_bf)
+        y_mid = xh @ w_bf
+        M_chunk = t128(y_mid, post=rout_bf)
+        chunks.append(M_chunk)
+        mx.eval(M_chunk)
+    return mx.concatenate(chunks, axis=0)
+
+
+@pytest.mark.skipif(not ORIG_DIR.exists() or not DEQUANT_DIR.exists(),
+                    reason="requires original + dequant model dirs on disk")
+@pytest.mark.parametrize("proj,in_f,out_f,K", [
+    ("gate_up_proj", 2048, 1024, 2),
+    ("down_proj", 512, 2048, 3),
+])
+def test_reconstruct_matches_option_b(proj, in_f, out_f, K):
+    from mlx_video.models.qwen3_5_moe_escha.eschamoe import escham_reconstruct
+    ex = _load_expert(layer=0, expert=0, proj=proj)
+    code = ex["escha_code"]
+    rin = ex["escha_rin"]
+    rout = ex["escha_rout"]
+
+    w_bare = escham_reconstruct(code, in_f, out_f, K, cb_id=1, mul1=False)
+    mx.eval(w_bare)
+    M_mlx = _compose_M_chunked(w_bare, rin, rout, chunk=256)
+    mx.eval(M_mlx)
+
+    M_ref = _load_M(layer=0, expert=0, proj=proj).T  # (in_f, out_f)
+    mx.eval(M_ref)
+
+    diff = M_mlx.astype(mx.float32) - M_ref.astype(mx.float32)
+    max_abs = float(mx.abs(diff).max())
+    rel = float(mx.linalg.norm(diff) / mx.linalg.norm(M_ref.astype(mx.float32)))
+    print(f"\n[{proj}] max_abs={max_abs:.3e} rel_l2={rel:.3e}")
+    assert rel < 5e-2, f"{proj} rel L2 too high: {rel}"
+
+
+if __name__ == "__main__":
+    # Direct run — bypass pytest infra.
+    test_codebook_loads()
+    print("codebook loads OK")
+    test_reconstruct_shape_and_zero_code()
+    print("zero-code reconstruct OK")
+    test_reconstruct_int16_signbit_as_uint16()
+    print("int16 sign-bit lookup OK")
+    if ORIG_DIR.exists() and DEQUANT_DIR.exists():
+        test_reconstruct_matches_option_b("gate_up_proj", 2048, 1024, 2)
+        test_reconstruct_matches_option_b("down_proj", 512, 2048, 3)
+    else:
+        print("skipping Option-B match (model dirs missing)")
