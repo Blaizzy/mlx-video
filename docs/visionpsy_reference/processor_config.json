@@ -1,0 +1,6 @@
+{
+  "processor_class": "VisionPsyNanoProcessor",
+  "auto_map": {
+    "AutoProcessor": "processing_visionpsynano.VisionPsyNanoProcessor"
+  }
+}
