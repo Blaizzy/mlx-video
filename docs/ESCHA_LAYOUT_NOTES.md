@@ -187,3 +187,59 @@ implementation cover both K in the same code path.
 
 **Modal cost so far**: ~$0.10 total across the two probes (both finished in
 under 1s wall time on A10G).
+
+---
+
+## §3.1 — 2026-08-01 evening: extraction ran, factorisation insufficient
+
+**Full extraction** (`modal_extract_v3.py`, 24 min A10G, ~$0.30):
+- Extracted all 32 solo functions for K=2 gate_up + all 48 for K=3 down_proj.
+- Extracted cross function samples (rows + cols with 4 ref values each) for
+  ALL 15 interacting pairs × K K-layers × 2 variants = 90 cross pairs.
+- Saved `full_extract_v4.pkl` (21.7 GB raw, ~1.5 GB compressed npz codebook).
+
+**Factorisation with rank=4 cross-approximation**: `build_codebook_v3.py`
+produces `codebook_v3.npz` (1 GB). Reconstruction test
+(`test_recon_v3.py`) against a real expert code gives:
+
+- gate_up (K=2): |w_recon|max = 37 vs |w_ref|max = 3.9. Rel err = **180%**.
+- down_proj (K=3): |w_recon|max = 67 vs 3.9. Rel err = **301%**.
+
+**Root cause of high error** (`debug_cross_matrix.py`):
+- For **most (v0, v1) combinations tested**, cross(v0, v1) ≈ 0. The pair truly
+  equals solo_i(v0) + solo_j(v1). Additivity holds.
+- Cross is only non-zero at overlap pixels for SPECIFIC combinations of code
+  values (e.g. v0=-1 vs any v1 gave cross ∈ {-0.77, 1.58, 0.05, 3.55}).
+- Real expert codes contain values across all int16 range (including many
+  negatives) — hence non-additivity accumulates to ~5-10 per weight per block.
+
+**Solo structure is much more subtle than "codebook lookup"**
+(`debug_recon.py`, `full_extract_v4.pkl` inspection):
+- solo_0(v)[pixel (2, 0)] = 0 for v ∈ [1, 10000]; non-zero for v ∈ [32000+]
+  and for v with high bit set (negative int16).
+- Different v values activate **different sparsity patterns** within a slot's
+  union support. This is bit-pattern dependent, not scalar-magnitude dependent.
+
+**Extraction of higher-rank cross factorisation (rank ≥ 16, wider ref set) is
+likely required.** Alternatively, the pair op may use a bit-level decomposition
+that would be more compactly captured by directly extracting bit-set patterns
+per code position.
+
+## §3.2 — Recommended next steps (bounded exploration exhausted)
+
+Given the observed subtlety of the code→pixel mapping (bit-pattern dependent),
+and the failure of a naive rank-4 cross-approximation to close the reconstruction
+error to acceptable levels, three viable forward paths:
+
+- **Option B (pre-dequantize)** — call the reference op on all 20 480 real
+  expert code tensors on Modal, save dense bf16 weights (~35 GB), load
+  directly. Guaranteed correctness, ~5-10 min Modal, ~30-60 min download.
+- **Option A-2 (bit-decomposition extraction)** — hypothesise each code v =
+  b₀·2⁰ + b₁·2¹ + … + b₁₅·2¹⁵ and extract 16 per-bit contribution tiles per
+  slot. If the op is linear in v as a bit vector (not as a scalar), this
+  captures the full structure with 16 × 16 slot = 256 extractions per K-layer.
+- **Option A-3 (denser sampling + rank ≥ 16)** — re-run extraction with 32+
+  ref values (mix of powers of 2, sign-bit patterns, and random) and rank
+  ≥ 16 factorisation. Storage ≥ 4 GB per variant.
+
+**Decision**: pursue Option B as the highest-probability shipping path.
