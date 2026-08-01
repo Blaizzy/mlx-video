@@ -1,62 +1,59 @@
-# Twitter draft — Escha-W2 MLX (Options A + B)
+# Twitter draft — Escha-W2 MLX RE (packed impl NOT SHIPPED)
 
 DO NOT POST — user will post manually. Draft only.
 
-## Main tweet
+**Status update (2026-08-01):** Route B (dequant to 35 GB bf16) is *technically*
+working end-to-end but per project mandate is NOT shipped — a 35 GB fp16 model
+is not an "Escha port", it's an "Escha-decoded model". The compression is the
+whole point.
 
-> World-first Mac port of EschaLabs' 2-bit AQLM MoE, Qwen3.6-35B-A3B-Escha-W2,
-> running on MLX — plus the first public extraction of the packed codebook.
+Route A / A-2 / A-3 (true packed impl at 12 GB) is BLOCKED on the per-slot
+LUT nonlinearity finding (see below). Falling back to publishing the full RE
+diagnosis rather than shipping half-work.
+
+## Main tweet (RE writeup)
+
+> Reverse-engineering EschaLabs' Escha AQLM MoE runtime for a Mac (MLX) port.
+> Bounded exploration exhausted at ~$0.42 total Modal spend. TL;DR: the packed
+> codebook op is more structured than any bit-additive scheme captures. Ships
+> as an honest RE diagnosis, not a working port.
 >
-> Option B (dequant, shipping): 60 GB dense M matrices via identity trick, 17.79 tok/s greedy on M-series unified memory.
->
-> Option A (codebook reference, shipping): full Escha AQLM codebook (~120 MB)
-> extracted from `torch.ops.escha.escham_reconstruct` in 1024 Modal A10G op
-> calls (down from a naive 328 M).
->
-> Dequant weights: https://huggingface.co/KaedeTai/Qwen3.6-35B-A3B-Escha-W2-MLX
-> Codebook + audit: https://huggingface.co/KaedeTai/Qwen3.6-35B-A3B-Escha-W2-Codebook-Ref
+> Full notes: [github.com/Blaizzy/mlx-video PR #46]
 
-## Thread continuation
+## Thread
 
-**2/** The dequant trick: every Escha expert projection is
-`y = t128(t128(x·rin) @ escham_reconstruct(code), ·rout)`.
-All four steps are linear. So M = f(I). Pushed identity through the real op on
-Modal A10G, dumped 60 GB of bf16 dense weights. Total compute: ~$0.30.
+**2/** What we established (definitive):
+- op is EXACTLY linear across (bi, bj) tile blocks (superposition |diff|=0)
+- K-layers are strictly additive across layers
+- Within a K-layer, slots interact **only pairwise** at overlapping spatial
+  supports (3-way Möbius = 0)
+- 15 interacting slot-pairs per K-layer, structure derivable from (row%4, col//4)
 
-**3/** MLX side: naive scatter-gather MoE, per-row int8 attention (fp16-scale,
-bf16 dequant at load), Qwen3-Next GatedDeltaNet in pure MLX ops. Load 9s,
-prefill 1.2s, decode 17.79 tok/s, peak 70 GB Metal memory.
+**3/** What we HOPED (A-2 / bit-decomposition):
+- Each per-slot int16 code v would decompose as δ(v) = Σ_{i: bit_i(v)==1} P[k,i]
+- If true → 16 patterns × 16 slots × 2 K-layers = ~2 MB per K variant.
+  World-first real packed Mac impl at ~12 GB.
 
-**4/** The codebook extraction (Option A) is what a naive one-code-at-a-time
-sweep would have taken 91 h of A10G for (328 M op calls, ~$100). Wrong shape
-of probe.
+**4/** Reality:
+- 2-way bit Möbius: 120/120 pairs non-zero (up to |cross|max=9.7)
+- 3-way bit Möbius: 16/16 triples non-zero (up to |R3|max=7.5)
+- No v/-v symmetry — no hidden odd/even linearity
+- Predicted magnitude grows linearly with bit-count; actual saturates at 3-5
+- The per-slot function is genuinely nonlinear in v at every order.
 
-**5/** Right shape: op audit first. Discovered
-(a) op is EXACTLY linear in codes (superposition |diff|=0),
-(b) codebook is (bi, bj)-invariant across all tile blocks,
-(c) op accepts leading batch dims on packed.
+**5/** Interpretation: the LUT is likely a scaled lattice / structured
+quantizer / Hadamard-of-inner-codebook, not a bit-additive superposition.
+The 65536 codes really are 65536 distinct outputs per slot. Compression to
+&lt;120 MB would require either upstream disclosure of the analytic form, or
+a spectral / lattice-informed probe we don't currently have designed.
 
-**6/** From (a)+(b): every one of the 8192 tile-blocks in a (128, 64, 32) code
-tensor is a free test bed for a distinct codebook entry, in a single op call.
-That collapses the sweep to **256 op calls for K=2 + 768 for K=3 = 1024 total.
-~2 minutes A10G.**
+**6/** Cost log across all routes: ~$0.42 total Modal A10G. Extraction script
+and all probes MIT-licensed at [github.com/Blaizzy/mlx-video branch
+`escha-mlx-port`]. Failure report so someone else can build on the diagnosis.
 
-**7/** Extracted codebook: (65 536 codes × 32 k_slots × 16 × 16 fp16) per K,
-sparse-compact to 120 MB total for both K values.
+**7/** What'd complete the port: a &lt;1-day EschaLabs disclosure of the
+`escham_reconstruct` internal codebook math, or a probe designed against a
+specific hypothesized LUT family. Both are natural handoffs.
 
-**8/** Known limit — full packed-inference is 95% there. Isolated single-code
-lookups match the CUDA op exactly (up to bf16 noise). At real-expert code
-density (all 262 K slots active) there's an unresolved additive term (~4 kOhm
-norm) that needs one more 30-second Modal probe to resolve. Workspace hit
-spend limit before the follow-up. Details in `LAYOUT_NOTES.md` in the
-codebook repo.
-
-**9/** For now the Option-B dense variant is the working end-to-end port. The
-codebook repo ships as reference for anyone completing the packed path — the
-Modal reproducer scripts, op signature audit, and layout notes are all there.
-
-**10/** Full port code: github.com/Blaizzy/mlx-video branch `escha-mlx-port`.
-PR to Blaizzy/mlx-video incoming.
-
-Credit: @EschaLabs for the 2-bit runtime, @modal for the throwaway CUDA
-on-demand, @Blaizzy for mlx-video.
+Credit: @EschaLabs for the runtime + weights; @modal for the throwaway A10G;
+@Blaizzy for mlx-video.

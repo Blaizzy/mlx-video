@@ -243,3 +243,107 @@ error to acceptable levels, three viable forward paths:
   ≥ 16 factorisation. Storage ≥ 4 GB per variant.
 
 **Decision**: pursue Option B as the highest-probability shipping path.
+
+---
+
+## §3.3 — 2026-08-01: Option A-2 (bit-decomposition) FALSIFIED
+
+**Hypothesis:** For each slot k in K-layer, δ_k(v) = Σ_{i: bit_i(v)==1} P[k, i]
+where P is a (16, 16, 16) fp16 per-slot bit-pattern table. If true, the per-slot
+codebook collapses from 65536 entries to 16 → total ~2 MB per (K, K-layer),
+enabling the world-first Mac Escha-W2 real packed impl.
+
+**Probes** (`codebooks/modal_bit_decomp_probe.py` + `codebooks/modal_bit_mobius.py`,
+2 A10G runs, ~2 s total, ~$0.02):
+
+### A. Extraction (`bit_decomp_probe_v1.pkl`)
+
+Extracted `pattern[K=2] shape=(32, 16, 16, 16)` and `pattern[K=3] shape=(48, 16, 16, 16)`
+by isolating `v = 2^bit` at one (bi, bj, k_slot) per bit, one op call per K.
+Every bit has non-zero footprint (nz_bits = 512/512 for K=2, 768/768 for K=3).
+Single-bit reconstruction verified: `delta(v=1) - pattern[k, 0]` max = 1e-3.
+
+### B. Additivity check (256 random v × 32 slots per K, one op call)
+
+Cross-K-layer additivity control: `|δ_AB - δ_A - δ_B|max = 0.0000e+00` (both K).
+Regression on J-final ✓.
+
+Within one K-layer, additive-bit prediction fails HARD:
+
+| K | max_abs_diff | rel_l2 | worst_v | actual_max | predicted_max |
+|---|--------------|--------|---------|------------|---------------|
+| 2 | 34.83        | 485 %  | 0xFFFF  | 5.63       | 35.83         |
+| 3 | 34.83        | 464 %  | 0xFFFF  | 5.63       | 35.83         |
+
+Predicted magnitude grows ~linearly with bit-count while actual saturates at
+~3-5 (see K=2 k_slot=0 diagnostic):
+
+    v=0x0001  n_bits=1  |actual|max=4.578  |pred|max=4.578  |diff|max=0.001
+    v=0x0003  n_bits=2  |actual|max=3.480  |pred|max=6.936  |diff|max=7.666
+    v=0x0007  n_bits=3  |actual|max=3.644  |pred|max=9.492  |diff|max=7.693
+    ...
+    v=0x00ff  n_bits=8  |actual|max=3.131  |pred|max=23.447 |diff|max=23.982
+
+### C. 2-way and 3-way bit Möbius (`bit_mobius_v1.pkl`), K=2 k_slot=0
+
+**All 120 bit-pairs have large non-additive cross terms.**
+0/120 near-zero, 120/120 with |cross|max > 0.1, max value 9.70.
+Structural repeat: pairs (0,3), (2,5), (4,7), (6,9), (8,11), (10,13), (12,15)
+all give exactly |cross|max = 9.6973 — suggests some periodic bit-role structure
+inside the 16-bit code.
+
+**All 16 sampled bit-triples have large 3-way Möbius residuals.**
+0/16 near-zero, 16/16 with |R3|max > 0.1, max value 7.51.
+
+**Symmetry:** δ(-v) is neither δ(v) nor -δ(v). No sign or negation symmetry
+recovers a hidden linear structure.
+
+### Conclusion
+
+The per-slot function δ_k(v) is **genuinely nonlinear in v's bits at every
+order** — pair-corrections don't close it, triple-corrections don't close it, and
+sign-symmetry doesn't recover linearity. The codebook cannot be compressed via
+any bit-additive scheme.
+
+The op's true structure is (empirically):
+
+    δ_slot_k(v) = LUT[k, v]              # 65536-entry per-slot table
+
+The J-final `compact.pkl` (120 MB) already IS that LUT, and it correctly
+reproduces single-slot-active deltas. The remaining reconstruction error at
+high code density comes from the (slot_i, slot_j) spatial-overlap pair terms
+(the 15 pairs per K-layer identified in §3), which themselves have subtle
+per-(v_i, v_j) structure that a rank-4 factorization did not capture.
+
+### Per user's bounded-exploration policy — STOP here.
+
+- Modal spend total (A-2 phase): ~$0.02. Remaining budget: ~$9.48 of $10.
+- Cumulative Escha RE spend across all routes: ~$0.42.
+- **Ship policy:** real packed 12 GB or nothing. Route B (35 GB dequant) not
+  shipped per user's mandate.
+- Deliverables: this notes doc, `modal_bit_decomp_probe.py`,
+  `modal_bit_mobius.py`, `bit_decomp_probe_v1.pkl`, `bit_mobius_v1.pkl`,
+  updated EschaLabs HF discussion draft, Twitter draft, PR #46 update.
+
+## §3.4 — What community/EschaLabs can build on
+
+The RE findings that ARE definitive and reusable:
+
+1. **Op signature**: exactly linear across (bi, bj) blocks and across K-layers.
+   Non-additive within K-layer at overlapping slots.
+2. **Slot spatial supports**: 15 interacting pairs per K-layer (see §3 rules).
+3. **3-way Möbius (slot level)**: zero. Confirms strict pairwise-only slot
+   interactions.
+4. **Per-slot LUT is nonlinear in bit vector at every order.** Not a bit-code.
+   Likely a lattice / permutation / structured-nonlinear function.
+5. **Extracted per-slot LUTs** available at `codebooks/layout_v2/cb_K{2,3}.npy`
+   on the `escha-codebooks` Modal Volume (1 GB + 1.5 GB fp16 dense form).
+
+The remaining unknown is the analytic form of the per-slot LUT: it might
+correspond to a small dense inner codebook + int16-indexed permutation, an
+AQLM-lattice quantizer with per-position sign flips, or a scaled Hadamard
+of a compact learned matrix. Any of these would compress the LUT well below
+120 MB — but distinguishing them requires either upstream disclosure from
+EschaLabs or a more sophisticated (spectrally-informed) probe than we
+currently have. This is a natural handoff to EschaLabs or a follow-up
+research effort.

@@ -134,13 +134,13 @@ def probe() -> bytes:
         n_nz_bits = int(np.sum(np.any(pattern != 0, axis=(2, 3))))
         print(f"  extracted pattern[K={K}] shape={pattern.shape} nz_bits={n_nz_bits}/{k_max*16}", flush=True)
 
-        # ---- P_ADD: 100 random v × k_max slots, additivity check ----
-        # Uses 100 * k_max <= blocks_per_op probes in ONE op call.
-        n_rand = 100
-        rand_vs = rng.integers(0, 65536, size=n_rand, dtype=np.int64)
-        # A few adversarial values: hard bit patterns
+        # ---- P_ADD: n_rand random v × k_max slots, additivity check ----
+        # Fit n_rand * k_max <= blocks_per_op probes into ONE op call.
+        n_rand = max(1, blocks_per_op // k_max)  # K=2: 256, K=3: 85
+        rand_vs = rng.integers(0, 65536, size=max(0, n_rand-6), dtype=np.int64)
         forced = np.array([0x8000, 0xFFFF, 0x5555, 0xAAAA, 0x8001, 0x7FFF], dtype=np.int64)
         all_vs = np.concatenate([forced, rand_vs])[:n_rand]
+        print(f"  P_ADD: n_rand={n_rand}", flush=True)
 
         n_probes_add = n_rand * k_max
         assert n_probes_add <= blocks_per_op, (n_probes_add, blocks_per_op)
@@ -199,6 +199,59 @@ def probe() -> bytes:
             "per_k_max": per_k_max.tolist(),
             "per_k_rel_l2": (np.sqrt(per_k_diff_l2) / (np.sqrt(per_k_ref_l2) + 1e-12)).tolist(),
         }
+
+        # ---- P_DIAG: bit-progression diagnostic ----
+        # For k=0 slot, measure delta(v) as v accumulates bits, to characterize
+        # HOW additivity fails. Test v ∈ {2^0, 2^0+2^1, ..., sum_{i=0..15} 2^i}.
+        # Also single-bit deltas for reference.
+        k_diag = 0
+        diag_v_list = []
+        for n_bits in range(1, 17):
+            v = (1 << n_bits) - 1  # low n_bits set
+            diag_v_list.append(v)
+        # Also random 2-bit pairs
+        for a, b in [(0,1), (0,7), (0,15), (7,15), (1,2), (14,15)]:
+            diag_v_list.append((1<<a) | (1<<b))
+        # Also low-value scalars
+        diag_v_list.extend([1, 2, 3, 4, 5, 10, 100, 1000, 10000, 30000, 32767, 32768, 60000])
+        n_diag = len(diag_v_list)
+        assert n_diag <= blocks_per_op
+        p_diag = torch.zeros(cshape, dtype=torch.int16, device=device)
+        for i, v in enumerate(diag_v_list):
+            bi, bj = i // bj_max, i % bj_max
+            p_diag[bi, bj, k_diag] = _to_int16(int(v))
+        w_diag = op(p_diag, in_f, out_f, K, True, False).detach().cpu().numpy().astype(np.float32)
+        diag_records = []
+        for i, v in enumerate(diag_v_list):
+            bi, bj = i // bj_max, i % bj_max
+            actual = w_diag[bi*16:(bi+1)*16, bj*16:(bj+1)*16] - w0[bi*16:(bi+1)*16, bj*16:(bj+1)*16]
+            v_u = int(v) & 0xFFFF
+            pred = np.zeros((16, 16), dtype=np.float32)
+            bits_set = []
+            for bit in range(16):
+                if (v_u >> bit) & 1:
+                    pred += pattern[k_diag, bit].astype(np.float32)
+                    bits_set.append(bit)
+            diff = actual - pred
+            diag_records.append({
+                "v": int(v), "v_u": v_u, "bits_set": bits_set, "n_bits": len(bits_set),
+                "actual_max": float(np.abs(actual).max()),
+                "pred_max": float(np.abs(pred).max()),
+                "diff_max": float(np.abs(diff).max()),
+                "actual_l2": float(np.linalg.norm(actual)),
+                "pred_l2": float(np.linalg.norm(pred)),
+                "diff_l2": float(np.linalg.norm(diff)),
+            })
+        out[f"diag_K{K}"] = diag_records
+        print(f"  P_DIAG K={K} k=0 (some samples):", flush=True)
+        for r in diag_records[:8]:
+            print(f"    v=0x{r['v_u']:04x} n_bits={r['n_bits']} "
+                  f"|actual|max={r['actual_max']:.3f} |pred|max={r['pred_max']:.3f} "
+                  f"|diff|max={r['diff_max']:.3f}", flush=True)
+        for r in diag_records[16:22]:  # bit-pair records
+            print(f"    v=0x{r['v_u']:04x} bits={r['bits_set']} "
+                  f"|actual|max={r['actual_max']:.4f} |pred|max={r['pred_max']:.4f} "
+                  f"|diff|max={r['diff_max']:.4f}", flush=True)
 
         # ---- P_CROSS_K: cross-K-layer additivity control (only meaningful when k_max > 16) ----
         # Pick k_a in K-layer 0, k_b in K-layer 1. If additive, delta_AB = delta_A + delta_B.
