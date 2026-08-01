@@ -1,0 +1,71 @@
+variant,image,prompt_id,prompt,n_prompt_tokens,n_tiles,proc_s,prefill_s,decode_s,n_decode_tokens,decode_tok_s,peak_gpu_gb,stopped_early,output
+standard,portrait,describe_en,Describe this image in one sentence.,861,13,0.042,0.953,0.289,45,155.55,2.437,0,"A smiling man in a white lab coat, labeled with the name ""OICOMELVANG"" and a medical cross emblem, gestures with his right hand while seated at a desk in a well-lit office."
+standard,portrait,text_en,What text appears in this image?,861,13,0.035,0.112,0.132,7,53.06,2.437,0,OICOMELVANG
+standard,portrait,count_en,Count the objects/people in this image.,863,13,0.036,0.112,0.141,10,70.85,2.437,0,There are 3 people in the image.
+standard,portrait,subject_en,What is the main subject?,860,13,0.036,0.131,0.149,13,86.98,2.437,0,The main subject is a man wearing a white lab coat.
+standard,portrait,describe_zh,用一句話描述這張圖片。,874,13,0.032,0.113,0.18,22,122.12,2.438,0,他說：“OICOMELVANG，25158”。
+standard,anime_grid,describe_en,Describe this image in one sentence.,1121,17,0.074,0.304,0.353,56,158.74,2.906,0,"This image displays a digital fashion design software interface, showcasing various portrait and profile views of a woman in different outfits, including a cropped tank top, high-waisted jeans, and a white dress, along with motion-blurring and face-close-up options."
+standard,anime_grid,text_en,What text appears in this image?,1121,17,0.063,0.147,0.208,19,91.5,2.906,0,Cama loitapinal! Koma Side Profile Kana 35:4
+standard,anime_grid,count_en,Count the objects/people in this image.,1123,17,0.06,0.147,0.153,3,19.67,2.906,0,10
+standard,anime_grid,subject_en,What is the main subject?,1120,17,0.059,0.204,0.152,3,19.74,2.906,0,A woman
+standard,anime_grid,describe_zh,用一句話描述這張圖片。,1134,17,0.06,0.147,0.218,22,100.7,2.907,0,This is a digital fashion design software interface showcasing various portrait and profile views of a woman in different outfits.
+standard,neon_text,describe_en,Describe this image in one sentence.,1121,17,0.043,0.147,0.275,39,141.99,2.906,0,"A vibrant red neon sign reading ""HELLO KADE"" glows brightly on a rainy night down a wet city street, reflecting the lights of the surrounding buildings and streetlamps."
+standard,neon_text,text_en,What text appears in this image?,1121,17,0.042,0.146,0.164,6,36.6,2.906,0,HELLO KADE
+standard,neon_text,count_en,Count the objects/people in this image.,1123,17,0.046,0.147,0.181,11,60.84,2.906,0,There are 2 people visible in the image.
+standard,neon_text,subject_en,What is the main subject?,1120,17,0.046,0.147,0.163,6,36.73,2.906,0,HELLO KADE
+standard,neon_text,describe_zh,用一句話描述這張圖片。,1134,17,0.045,0.147,0.168,7,41.71,2.907,0,A rainy night in kade
+standard,screenshot,describe_en,Describe this image in one sentence.,1121,17,0.051,0.146,0.359,64,178.41,2.906,0,"This infographic compares four AI creation packages: PLUS, ULTRA, SEEDANCE 2.0, and UNLIMITED & FREE GENS, highlighting cost savings ($49, $428, $864) and features like parallel generations, Supercomputer access, and unlimited models."
+standard,screenshot,text_en,What text appears in this image?,1121,17,0.048,0.146,0.36,64,177.8,2.906,0,"PLUS 49% OFF For everyday AI creation ULTRA 56% OFF Best Value Select Offer Save $288 compared to monthly $49 $25 per month, billed annually  yellow Select Offer $429 $57 per month, billed annually"
+standard,screenshot,count_en,Count the objects/people in this image.,1123,17,0.048,0.146,0.337,57,169.36,2.906,0,"Based on the image provided, here is a count of the objects/people present:  **Objects/People:** *   **PLUS:** 1 *   **ULTRA:** 2 *   **SEEDANCE 2.0:** 3"
+standard,screenshot,subject_en,What is the main subject?,1120,17,0.047,0.146,0.152,3,19.77,2.906,0,AI creation
+standard,screenshot,describe_zh,用一句話描述這張圖片。,1134,17,0.047,0.148,0.249,31,124.27,2.907,0,"This is an infographic showcasing two different AI creation packages, PLUS and Ultra, highlighting their cost savings, features, and benefits for various AI projects."
+standard,chart,describe_en,Describe this image in one sentence.,861,13,0.034,0.113,0.23,37,160.66,2.437,0,"This bar chart compares revenue and cost for Q1-Q2 2026, showing that revenue exceeds cost by 100,000 in June."
+standard,chart,text_en,What text appears in this image?,861,13,0.034,0.113,0.155,14,90.34,2.437,0,Q1-Q2 2026 Revenue vs Cost
+standard,chart,count_en,Count the objects/people in this image.,863,13,0.034,0.113,0.116,2,17.28,2.437,0,Six
+standard,chart,subject_en,What is the main subject?,860,13,0.037,0.112,0.125,5,40.01,2.437,0,Revenue vs Cost
+standard,chart,describe_zh,用一句話描述這張圖片。,874,13,0.04,0.112,0.184,24,130.43,2.438,0,This bar chart compares the revenue and cost of a company during Q1-Q2 2026.
+standard,receipt,describe_en,Describe this image in one sentence.,861,13,0.032,0.112,0.313,64,204.22,2.437,0,"This image displays a receipt from Blue Bottle Cafe at 1234 Market St, San Francisco, showing the transaction details for a purchase of coffee, including items like Latte, Cappuccino, Croissant, Blueberry Muffin, and Sparkling Water, with a total cost of"
+standard,receipt,text_en,What text appears in this image?,861,13,0.032,0.113,0.316,64,202.68,2.437,0,"BLUE BOTTLE CAFE 1234 Market St, San Francisco Tel: (415) 555-0123 Receipt # A-084213 Date: 2026-07-31 1"
+standard,receipt,count_en,Count the objects/people in this image.,863,13,0.033,0.112,0.115,2,17.36,2.437,0,7
+standard,receipt,subject_en,What is the main subject?,860,13,0.037,0.112,0.145,11,75.81,2.437,0,The main subject is Blue Bottle Cafe.
+standard,receipt,describe_zh,用一句話描述這張圖片。,874,13,0.036,0.112,0.316,64,202.53,2.438,0,"This is a receipt from Blue Bottle Cafe at 1234 Market St, San Francisco, showing the payment for 2026-07-31 14:32, including items like Latte, Cappuccino, Croissant, Blueberry Muffin"
+standard,diagram,describe_en,Describe this image in one sentence.,861,13,0.032,0.112,0.245,43,175.34,2.437,0,"This flowchart illustrates the process of visionpsi-nano, starting with user uploads an image, passing through a preprocessor tiles, then to aSmoIL2 decoder, and finally generating text."
+standard,diagram,text_en,What text appears in this image?,861,13,0.032,0.112,0.135,8,59.1,2.437,0,VisionPsy-Nano flow
+standard,diagram,count_en,Count the objects/people in this image.,863,13,0.035,0.113,0.116,2,17.27,2.437,0,5
+standard,diagram,subject_en,What is the main subject?,860,13,0.034,0.113,0.135,8,59.24,2.437,0,VisionPsy-Nano flow
+standard,diagram,describe_zh,用一句話描述這張圖片。,874,13,0.034,0.113,0.214,32,149.86,2.438,0,"The image flows from the user uploads an image to the preprocessor tiles, then to the SmoIL2 decoder, and finally to generated text."
+flash,portrait,describe_en,Describe this image in one sentence.,471,7,0.02,0.27,0.151,30,198.49,2.359,0,"A man in a white lab coat with the name ""De WARON"" on it stands behind a desk, gesturing with his right hand."
+flash,portrait,text_en,What text appears in this image?,471,7,0.018,0.063,0.074,5,67.35,2.359,0,De Wooning
+flash,portrait,count_en,Count the objects/people in this image.,473,7,0.019,0.062,0.065,2,30.58,2.359,0,1
+flash,portrait,subject_en,What is the main subject?,470,7,0.02,0.062,0.139,26,186.45,2.359,0,The main subject is a man wearing a white lab coat with the name 'De Woon' and a logo on it.
+flash,portrait,describe_zh,用一句話描述這張圖片。,484,7,0.018,0.062,0.257,64,248.98,2.36,0,"这是一�lic控股的,話是柯尼特,黃色胸部有壊身跡,身ailed上有藥物處單"
+flash,anime_grid,describe_en,Describe this image in one sentence.,1121,17,0.061,0.156,0.307,48,156.47,2.906,0,"This image displays a collection of digital portrait templates featuring various angles of a woman in different outfits, including a full-body shot, a back view, and a close-up, alongside a side profile and a face close-up."
+flash,anime_grid,text_en,What text appears in this image?,1121,17,0.062,0.146,0.19,14,73.67,2.906,0,front - Full Body Kana 3/4 Portrait Side Profile
+flash,anime_grid,count_en,Count the objects/people in this image.,1123,17,0.061,0.146,0.179,11,61.44,2.906,0,There are 12 people in the image.
+flash,anime_grid,subject_en,What is the main subject?,1120,17,0.061,0.147,0.154,3,19.54,2.906,0,A woman
+flash,anime_grid,describe_zh,用一句話描述這張圖片。,1134,17,0.062,0.148,0.294,44,149.52,2.907,0,"A collection of fashion photos showcasing a model in various outfits, from a full-body front view to a close-up of her back, with a focus on the Canna Loiteral and Kama brands."
+flash,neon_text,describe_en,Describe this image in one sentence.,341,5,0.013,0.052,0.168,41,243.83,2.482,0,"A vibrant red neon sign reading ""HELLO KADE"" glows brightly on a rainy night in a city street, reflecting the lights and creating a striking contrast against the dark, wet pavement."
+flash,neon_text,text_en,What text appears in this image?,341,5,0.013,0.047,0.062,6,96.9,2.482,0,HELLO KADE
+flash,neon_text,count_en,Count the objects/people in this image.,343,5,0.013,0.048,0.077,11,142.06,2.482,0,I cannot count objects or people in the image.
+flash,neon_text,subject_en,What is the main subject?,340,5,0.014,0.046,0.088,15,170.06,2.482,0,The main subject is a neon sign that reads 'Hello Kade'.
+flash,neon_text,describe_zh,用一句話描述這張圖片。,354,5,0.013,0.047,0.131,29,221.25,2.483,0,"A rainy night in a small town, with a glowing red neon sign that reads ""HELLO KADE"" hanging above the street."
+flash,screenshot,describe_en,Describe this image in one sentence.,1121,17,0.049,0.147,0.312,49,156.88,2.906,0,"This infographic compares the cost savings of two AI creation platforms, PLUS and ULTRA, highlighting the benefits of the ULTRA plan for ambitious projects, such as parallel generations, access to supercomputers, and unlimited models and features."
+flash,screenshot,text_en,What text appears in this image?,1121,17,0.049,0.147,0.362,64,176.67,2.906,0,"PLUS 49% OFF For everyday AI creation  ULTRA 56% OFF For ambitious AI projects  Select Offer Save $288 compared to monthly  Parallel generations: up to 6 Videos, 8 Images Access to Supercomputer Access to all Seedance models"
+flash,screenshot,count_en,Count the objects/people in this image.,1123,17,0.05,0.147,0.154,3,19.53,2.906,0,12
+flash,screenshot,subject_en,What is the main subject?,1120,17,0.051,0.146,0.153,3,19.58,2.906,0,AI creation
+flash,screenshot,describe_zh,用一句話描述這張圖片。,1134,17,0.051,0.147,0.238,28,117.5,2.907,0,"This infographic compares the cost and benefits of two AI creation platforms, PLUS and ULTRA, highlighting their respective advantages and savings."
+flash,chart,describe_en,Describe this image in one sentence.,471,7,0.018,0.063,0.15,29,193.57,2.359,0,"The bar chart compares the revenue and cost of two departments, Revenue and Cost, for the six months ended June 2026."
+flash,chart,text_en,What text appears in this image?,471,7,0.019,0.062,0.071,4,55.95,2.359,0,Revenue Cost
+flash,chart,count_en,Count the objects/people in this image.,473,7,0.019,0.062,0.065,2,30.64,2.359,0,6
+flash,chart,subject_en,What is the main subject?,470,7,0.021,0.062,0.069,3,43.71,2.359,0,Revenue
+flash,chart,describe_zh,用一句話描述這張圖片。,484,7,0.021,0.062,0.158,32,202.19,2.36,0,"This bar chart compares the revenue and cost of two departments, Revenue and Cost, for the Q1-Q2 2026 period."
+flash,receipt,describe_en,Describe this image in one sentence.,211,3,0.006,0.04,0.134,36,268.12,2.723,0,"This image displays a receipt from Blue Bottle Cafe in San Francisco, detailing the purchase of various beverages and taxes, including a total of $30.18."
+flash,receipt,text_en,What text appears in this image?,211,3,0.006,0.031,0.217,64,295.0,2.723,0,"Blue Bottle Cafe   1234 Market St, San Francisco    Tel: (415) 556-0123    Receipt # A-084213    Date: 2026-07-31 14:32"
+flash,receipt,count_en,Count the objects/people in this image.,213,3,0.006,0.03,0.217,64,295.19,2.724,0,<think> I want to count the total number of items listed in the receipt above. There's a list of items with prices and quantities. I need to make sure I don't miss any or mix up names/people. Let's recount carefully.  1.  X Latte (12 oz)
+flash,receipt,subject_en,What is the main subject?,210,3,0.006,0.031,0.069,14,203.66,2.723,0,The main subject is a receipt from Blue Bottle Cafe.
+flash,receipt,describe_zh,用一句話描述這張圖片。,224,3,0.006,0.031,0.219,64,292.75,2.725,0,"This image shows a receipt from Blue Bottle Cafe, located at 1234 Market St, San Francisco. The receipt includes items such as one latte, one cappuccino, two croissants, one blueberry muffin, and two sparkling water. The total cost of the items is"
+flash,diagram,describe_en,Describe this image in one sentence.,211,3,0.007,0.031,0.113,29,257.37,2.723,0,"This flowchart illustrates the process of generating a vision-based Nano flow from user uploads of images and prompts, culminating in generated text."
+flash,diagram,text_en,What text appears in this image?,211,3,0.007,0.031,0.051,8,157.12,2.723,0,VisionPsy-Nano flow
+flash,diagram,count_en,Count the objects/people in this image.,213,3,0.007,0.031,0.033,2,60.2,2.724,0,1
+flash,diagram,subject_en,What is the main subject?,210,3,0.007,0.031,0.051,8,156.81,2.723,0,VisionPsy-Nano flow
+flash,diagram,describe_zh,用一句話描述這張圖片。,224,3,0.007,0.03,0.113,29,257.05,2.725,0,"This flowchart illustrates the process of generating a vision-based Nano flow, starting from user uploads of images and culminating in generated text."

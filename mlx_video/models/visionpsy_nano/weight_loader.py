@@ -45,12 +45,25 @@ def _torch_to_mlx_dtype(name: str) -> mx.Dtype:
 
 
 def _load_raw(weights_path: Path) -> Dict[str, mx.array]:
-    """Return the safetensors file as a dict of MLX arrays."""
+    """Return the safetensors file as a dict of MLX arrays.
+
+    Uses the torch backend so we can handle bf16 checkpoints (numpy has no
+    native bfloat16). Non-bf16 tensors flow through numpy directly; bf16
+    tensors are viewed as uint16 and reinterpreted as MLX bfloat16 without
+    a lossy fp32 detour.
+    """
+    import torch
+
     out: Dict[str, mx.array] = {}
-    with safe_open(str(weights_path), framework="numpy") as f:
+    with safe_open(str(weights_path), framework="pt") as f:
         for k in f.keys():
-            arr = f.get_tensor(k)
-            out[k] = mx.array(arr)
+            t = f.get_tensor(k)
+            if t.dtype == torch.bfloat16:
+                # torch bf16 -> uint16 view -> numpy -> mlx uint16 -> reinterpret
+                arr_u16 = mx.array(t.view(torch.uint16).numpy())
+                out[k] = arr_u16.view(mx.bfloat16)
+            else:
+                out[k] = mx.array(t.numpy())
     return out
 
 
