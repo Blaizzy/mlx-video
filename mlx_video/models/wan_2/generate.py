@@ -808,6 +808,414 @@ def generate_video(
     print(f"{Colors.DIM}  Total time: {time.time() - t1:.1f}s{Colors.RESET}")
 
 
+def generate_s2v_video(
+    model_dir: str,
+    prompt: str,
+    image: str,
+    audio: str,
+    negative_prompt: str | None = None,
+    width: int = 512,
+    height: int = 512,
+    num_frames: int = 81,
+    steps: int | None = None,
+    guide_scale: float | tuple | None = None,
+    shift: float | None = None,
+    seed: int = -1,
+    output_path: str = "output_s2v.mp4",
+    scheduler: str = "unipc",
+    tiling: str = "auto",
+    no_compile: bool = False,
+    audio_scale: float = 1.0,
+):
+    """End-to-end Wan 2.2 Speech-to-Video generation.
+
+    Args:
+        model_dir: converted MLX S2V model directory (must contain
+            ``model.safetensors``, ``t5_encoder.safetensors``,
+            ``vae.safetensors``, ``config.json``).
+        prompt: text prompt describing the scene.
+        image: path to the reference (portrait) image.
+        audio: path to the driving audio (.wav, mono, 16 kHz preferred).
+        negative_prompt: passed to CFG. Defaults to the model's Chinese
+            negative prompt when None.
+        width/height: video resolution (aligned to VAE stride * patch).
+        num_frames: number of pixel frames to render (must be 4n+1).
+        steps: diffusion steps. Defaults to ``config.sample_steps``.
+        guide_scale: CFG scale. Defaults to ``config.sample_guide_scale``.
+        shift: flow-matching shift. Defaults to ``config.sample_shift``.
+        seed: RNG seed. -1 = random.
+        output_path: MP4 output path.
+        scheduler: 'unipc' | 'dpm++' | 'euler'.
+        tiling: VAE-decode tiling mode (see ``generate_video``).
+        no_compile: skip ``mx.compile`` on the transformer.
+
+    This function is untested end-to-end in the CI sandbox. Run on Mac to
+    produce an actual MP4. Known limitations tagged with ``TODO(verify)``:
+      * Ref-image RoPE position (design says index 30) is currently *not*
+        applied — appended tokens skip RoPE. First-frame results may show
+        artifacts until the ref-position RoPE is wired up.
+      * Motion-history / framepack is not passed by default here (talking
+        head first-clip case). Extend by adding a ``motion_history`` arg.
+    """
+    import json
+
+    from mlx_video.models.wan_2.config import WanModelConfig
+    from mlx_video.models.wan_2.scheduler import (
+        FlowDPMPP2MScheduler,
+        FlowMatchEulerScheduler,
+        FlowUniPCScheduler,
+    )
+    from mlx_video.models.wan_2.audio_encoder import extract_wav2vec_features
+
+    model_dir = Path(model_dir)
+
+    # ------ config ------
+    config_path = model_dir / "config.json"
+    quantization = None
+    if config_path.exists():
+        with open(config_path) as f:
+            cfg_dict = json.load(f)
+        quantization = cfg_dict.pop("quantization", None)
+        for k in (
+            "patch_size", "vae_stride", "window_size", "sample_guide_scale",
+            "audio_inject_layers",
+        ):
+            if k in cfg_dict and isinstance(cfg_dict[k], list):
+                cfg_dict[k] = tuple(cfg_dict[k])
+        config = WanModelConfig(
+            **{k: v for k, v in cfg_dict.items()
+               if k in WanModelConfig.__dataclass_fields__}
+        )
+    else:
+        config = WanModelConfig.wan22_s2v_14b()
+
+    if config.model_type != "s2v":
+        print(f"{Colors.YELLOW}  Overriding config.model_type='{config.model_type}' → 's2v'{Colors.RESET}")
+        config = WanModelConfig.wan22_s2v_14b()
+
+    if steps is None:
+        steps = config.sample_steps
+    if shift is None:
+        shift = config.sample_shift
+    if guide_scale is None:
+        guide_scale = config.sample_guide_scale
+    if isinstance(guide_scale, tuple):
+        cfg_disabled = all(gs <= 1.0 for gs in guide_scale)
+    else:
+        cfg_disabled = float(guide_scale) <= 1.0
+
+    if negative_prompt is None:
+        neg_prompt_resolved = config.sample_neg_prompt
+    else:
+        neg_prompt_resolved = negative_prompt
+
+    assert (num_frames - 1) % 4 == 0, f"num_frames must be 4n+1, got {num_frames}"
+
+    print(f"{Colors.CYAN}{'='*60}")
+    print(f"  Wan{config.model_version} Speech-to-Video (MLX, Phase-2)")
+    print(f"{'='*60}{Colors.RESET}")
+    print(f"{Colors.DIM}  Model dir: {model_dir}")
+    print(f"  Prompt: {prompt}")
+    print(f"  Ref image: {image}")
+    print(f"  Audio: {audio}")
+    print(f"  Size: {width}x{height}, Frames: {num_frames}")
+    print(f"  Steps: {steps}, Guide: {guide_scale}, Shift: {shift}")
+    print(f"  Audio scale: {audio_scale}{Colors.RESET}")
+
+    if seed < 0:
+        seed = random.randint(0, 2**32 - 1)
+    mx.random.seed(seed)
+    np.random.seed(seed)
+    print(f"{Colors.DIM}  Seed: {seed}{Colors.RESET}")
+
+    # Align dimensions.
+    vae_stride = config.vae_stride
+    patch_size = config.patch_size
+    align_h = patch_size[1] * vae_stride[1]
+    align_w = patch_size[2] * vae_stride[2]
+    if height % align_h != 0 or width % align_w != 0:
+        height = max(align_h, (height // align_h) * align_h)
+        width = max(align_w, (width // align_w) * align_w)
+        print(f"{Colors.DIM}  Aligned to {width}x{height}{Colors.RESET}")
+    if config.max_area > 0 and height * width > config.max_area:
+        width, height = _best_output_size(width, height, align_w, align_h, config.max_area)
+        print(f"{Colors.YELLOW}  Clamped to {width}x{height}{Colors.RESET}")
+
+    z_dim = config.vae_z_dim
+    t_latent = (num_frames - 1) // vae_stride[0] + 1
+    h_latent = height // vae_stride[1]
+    w_latent = width // vae_stride[2]
+    target_shape = (z_dim, t_latent, h_latent, w_latent)
+    seq_len = math.ceil((h_latent * w_latent) / (patch_size[1] * patch_size[2]) * t_latent)
+
+    # ------ text encoder ------
+    t1 = time.time()
+    print(f"\n{Colors.BLUE}Loading T5 encoder...{Colors.RESET}")
+    t5_path = model_dir / "t5_encoder.safetensors"
+    t5_encoder = load_t5_encoder(t5_path, config)
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained("google/umt5-xxl")
+    print(f"{Colors.BLUE}Encoding text...{Colors.RESET}")
+    context = encode_text(t5_encoder, tokenizer, prompt, config.text_len)
+    if cfg_disabled:
+        context_null = None
+        mx.eval(context)
+    else:
+        context_null = encode_text(t5_encoder, tokenizer, neg_prompt_resolved, config.text_len)
+        mx.eval(context, context_null)
+    del t5_encoder
+    gc.collect()
+    mx.clear_cache()
+    print(f"{Colors.DIM}  T5 encoding: {time.time() - t1:.1f}s{Colors.RESET}")
+
+    # ------ VAE encode reference image ------
+    print(f"\n{Colors.BLUE}Encoding reference image...{Colors.RESET}")
+    vae_path = model_dir / "vae.safetensors"
+    # preprocess_image returns channels-LAST (1, 1, H, W, 3), but WanVAE.encode
+    # expects channels-FIRST (B, 3, T=1, H, W). Transpose accordingly.
+    img_tensor = preprocess_image(image, width, height)  # (1, 1, H, W, 3)
+    img_tensor = mx.transpose(img_tensor, (0, 4, 1, 2, 3))  # (1, 3, 1, H, W)
+    mx.eval(img_tensor)
+    vae_enc = load_vae_encoder(vae_path, config)
+    z_ref = vae_enc.encode(img_tensor)  # (1, z_dim, 1, H_lat, W_lat) channel-first
+    mx.eval(z_ref)
+    # to (z_dim, 1, H_lat, W_lat)
+    z_ref = z_ref[0]  # drop batch dim → (z_dim, 1, H_lat, W_lat)
+
+    # (Deleted: dead VAE-encode-black-frames path.  Phase 3c set
+    # motion_history_latent=None because kijai's non-framepack context-window
+    # branch does not pass s2v_ref_motion.  Encoding 73 solid-black pixel
+    # frames took ~30s per run and was thrown away unused.)
+
+    del vae_enc, img_tensor
+    gc.collect()
+    mx.clear_cache()
+
+    # ------ wav2vec2 features ------
+    print(f"\n{Colors.BLUE}Extracting wav2vec2 features...{Colors.RESET}")
+    # Compute the video frames the S2V transformer sees (post-patchify F axis).
+    F_vid = t_latent // patch_size[0]
+    # Prefer the wav2vec2 bundled with the S2V checkpoint — those weights are
+    # 100x smaller magnitude than facebook/wav2vec2-large-xlsr-53 (which is the
+    # unfine-tuned base) and produce meaningful audio embeddings.
+    w2v_candidates = [
+        model_dir / "wav2vec2-large-xlsr-53-english",
+        model_dir.parent / "Wan2.2-S2V-14B" / "wav2vec2-large-xlsr-53-english",
+        Path.home() / "mlx-video/checkpoints/Wan2.2-S2V-14B/wav2vec2-large-xlsr-53-english",
+    ]
+    w2v_model_name = "jonatasgrosman/wav2vec2-large-xlsr-53-english"
+    for cand in w2v_candidates:
+        if cand.exists() and (cand / "config.json").exists():
+            w2v_model_name = str(cand)
+            break
+    print(f"{Colors.DIM}  wav2vec2: {w2v_model_name}{Colors.RESET}")
+    audio_feat = extract_wav2vec_features(
+        wav_path=audio,
+        num_video_frames=F_vid,
+        num_audio_token=config.num_audio_token,
+        model_name=w2v_model_name,
+    )  # (1, 25, 1024, F_vid * num_audio_token)
+    mx.eval(audio_feat)
+
+    # ------ transformer ------
+    print(f"\n{Colors.BLUE}Loading S2V transformer...{Colors.RESET}")
+    t2 = time.time()
+    single_model = load_wan_model(
+        model_dir / "model.safetensors", config, quantization
+    )
+    print(f"{Colors.DIM}  Model loaded: {time.time() - t2:.1f}s{Colors.RESET}")
+
+    # Precompute text embeddings + cross-attn K/V.
+    if cfg_disabled:
+        context_emb = single_model.embed_text([context])
+        mx.eval(context_emb)
+        context_cond = context_emb[0:1]
+        cross_kv = single_model.prepare_cross_kv(context_cond)
+    else:
+        context_emb = single_model.embed_text([context, context_null])
+        mx.eval(context_emb)
+        context_cfg = mx.concatenate([context_emb[0:1], context_emb[1:2]], axis=0)
+        cross_kv = single_model.prepare_cross_kv(context_cfg)
+    mx.eval(cross_kv)
+
+    # Multi-segment RoPE: covers [noise, ref, motion] in a single (cos, sin)
+    # so ref gets t=max(30, F+9) and motion buckets t=-1/-3/-19. Verified
+    # against kijai wanvideo/modules/model.py::rope_encode_comfy (line 2705).
+    f_grid = t_latent // patch_size[0]
+    h_grid = h_latent // patch_size[1]
+    w_grid = w_latent // patch_size[2]
+    # Reference latent grid: single frame at the same H_lat, W_lat.
+    ref_grid = (
+        (z_ref.shape[1], h_grid, w_grid) if z_ref is not None else None
+    )
+    # Early-fail if dimensions won't survive the coarse motion-projection.
+    # coarse proj kernel is (4, 8, 8); h_latent = height // vae_stride[1] must
+    # be divisible by 8. In practice: height AND width must be divisible by
+    # (vae_stride * 8) = 64.  Better a clear message here than an AssertionError
+    # inside pack_motion_frames on step 0.
+    if h_latent % 8 != 0 or w_latent % 8 != 0:
+        raise ValueError(
+            f"S2V dimensions height={height}, width={width} give latent grid "
+            f"H={h_latent}, W={w_latent}. Coarse motion kernel is (4,8,8) so "
+            f"latent H and W must be divisible by 8 (i.e. pixel height/width "
+            f"must be divisible by 64). Try e.g. 448x256, 512x320, 640x384."
+        )
+
+    # Motion history: kijai's non-framepack context-window path does NOT pass
+    # s2v_ref_motion to the model (nodes_sampler.py L2038: only s2v_audio_input,
+    # s2v_motion_frames=[1,0], s2v_pose passed — no ref_motion). Only the
+    # framepack loop path feeds a VAE-encoded motion buffer, and even THERE
+    # kijai explicitly drops the first 3 output pixel frames (line 2168:
+    # `if r == 0: image = image[:, :, 3:]`) — the very --trim-first-frames
+    # workaround we're forbidden.  For single-clip inference we therefore
+    # follow the non-framepack path and pass None: no motion tokens are added
+    # to the sequence and no warmup pulse can occur.  (The VAE(black) encode
+    # attempt at commit a43bd8e still left ~19 motion tokens biasing frame 0.)
+    zero_motion_latent = None
+
+    # RoPE covers noise + ref only when motion is disabled. Motion shapes
+    # would be applied downstream *only* if motion_history_latent is not None.
+    motion_shapes = None
+    rope_cos_sin = single_model.prepare_rope_s2v(
+        noise_grid=(f_grid, h_grid, w_grid),
+        ref_grid=ref_grid,
+        motion_shapes=motion_shapes,
+    )
+    mx.eval(rope_cos_sin)
+
+    # Scheduler
+    _schedulers = {
+        "euler": FlowMatchEulerScheduler,
+        "dpm++": FlowDPMPP2MScheduler,
+        "unipc": FlowUniPCScheduler,
+    }
+    sched_cls = _schedulers.get(scheduler, FlowUniPCScheduler)
+    sched = sched_cls(num_train_timesteps=config.num_train_timesteps)
+    sched.set_timesteps(steps, shift=shift)
+
+    latents = mx.random.normal(target_shape)
+
+    # ------ diffusion loop ------
+    print(f"\n{Colors.GREEN}Denoising ({steps} steps)...{Colors.RESET}")
+    t3 = time.time()
+    timestep_list = sched.timesteps.tolist()
+    for i in tqdm(range(steps), desc="Diffusion"):
+        timestep_val = timestep_list[i]
+        if cfg_disabled:
+            t_batch = mx.array([timestep_val])
+            preds = single_model(
+                [latents],
+                t=t_batch,
+                context=context_cond,
+                seq_len=seq_len,
+                audio_input=audio_feat,
+                ref_image_latent=z_ref,
+                motion_history_latent=zero_motion_latent,
+                cross_kv_caches=cross_kv,
+                rope_cos_sin=rope_cos_sin,
+                audio_scale=audio_scale,
+            )
+            noise_pred = preds[0]
+        else:
+            t_batch = mx.array([timestep_val, timestep_val])
+            # Kijai (wanvideo/modules/model.py L2417-2418):
+            #   if is_uncond: s2v_audio_input = s2v_audio_input * 0
+            # The uncond forward MUST see zeroed audio so CFG guidance
+            # (cond - uncond) preserves the audio-driven direction. Without
+            # this, both halves of the CFG batch respond to the same audio
+            # and the delta loses its audio component => mouth motion decouples
+            # from phonemes (visible lipsync miss).
+            zero_audio = mx.zeros_like(audio_feat)
+            audio_b = mx.concatenate([audio_feat, zero_audio], axis=0)
+            gs = guide_scale if isinstance(guide_scale, (int, float)) else guide_scale[0]
+            preds = single_model(
+                [latents, latents],
+                t=t_batch,
+                context=context_cfg,
+                seq_len=seq_len,
+                audio_input=audio_b,
+                ref_image_latent=z_ref,
+                motion_history_latent=zero_motion_latent,
+                cross_kv_caches=cross_kv,
+                rope_cos_sin=rope_cos_sin,
+                audio_scale=audio_scale,
+            )
+            noise_pred_cond, noise_pred_uncond = preds[0], preds[1]
+            noise_pred = noise_pred_uncond + gs * (noise_pred_cond - noise_pred_uncond)
+
+        latents = sched.step(noise_pred[None], timestep_val, latents[None]).squeeze(0)
+        mx.eval(latents)
+    print(f"{Colors.DIM}  Denoising: {time.time() - t3:.1f}s{Colors.RESET}")
+
+    del single_model, cross_kv
+    gc.collect()
+    mx.clear_cache()
+
+    # ------ VAE decode ------
+    print(f"\n{Colors.BLUE}Decoding with VAE...{Colors.RESET}")
+    t4 = time.time()
+    vae = load_vae_decoder(vae_path, config)
+    from mlx_video.models.ltx_2.video_vae.tiling import TilingConfig
+    if tiling == "none":
+        tiling_config = None
+    elif tiling == "auto":
+        tiling_config = TilingConfig.auto(height, width, num_frames)
+    else:
+        tiling_config = TilingConfig.default()
+
+    if tiling_config is not None:
+        video = vae.decode_tiled(latents[None], tiling_config)
+    else:
+        video = vae.decode(latents[None])
+    mx.eval(video)
+    print(f"{Colors.DIM}  VAE decode: {time.time() - t4:.1f}s{Colors.RESET}")
+    video = np.array(video[0])  # (3, T', H, W)
+    video = (video + 1.0) / 2.0
+    video = np.clip(video * 255.0, 0, 255).astype(np.uint8)
+    video = video.transpose(1, 2, 3, 0)  # (T, H, W, 3)
+
+    save_video(video, output_path, fps=config.sample_fps)
+    print(f"\n{Colors.GREEN}✓ Video saved to {output_path}{Colors.RESET}")
+    print(f"{Colors.DIM}  Total time: {time.time() - t1:.1f}s{Colors.RESET}")
+
+
+def _dispatch_s2v(args):
+    """CLI entry point for Wan 2.2 S2V."""
+    guide_scale = None
+    if args.guide_scale is not None:
+        parts = [float(x) for x in args.guide_scale.split(",")]
+        guide_scale = tuple(parts) if len(parts) > 1 else parts[0]
+
+    neg_prompt = args.negative_prompt
+    if args.no_negative_prompt:
+        neg_prompt = ""
+
+    if not args.image:
+        raise ValueError("--image PATH is required for S2V (reference image).")
+    if not args.audio:
+        raise ValueError("--audio PATH is required for S2V (driving audio).")
+
+    generate_s2v_video(
+        model_dir=args.model_dir,
+        prompt=args.prompt,
+        image=args.image,
+        audio=args.audio,
+        negative_prompt=neg_prompt,
+        width=args.width,
+        height=args.height,
+        num_frames=args.num_frames,
+        steps=args.steps,
+        guide_scale=guide_scale,
+        shift=args.shift,
+        seed=args.seed,
+        output_path=args.output_path,
+        scheduler=args.scheduler,
+        tiling=args.tiling,
+        no_compile=args.no_compile,
+        audio_scale=args.audio_scale,
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description="Wan Text-to-Video Generation (MLX)")
     parser.add_argument(
@@ -821,7 +1229,20 @@ def main():
         "--image",
         type=str,
         default=None,
-        help="Path to input image for I2V (omit for T2V mode)",
+        help="Path to input image for I2V or S2V reference image (omit for T2V mode)",
+    )
+    parser.add_argument(
+        "--audio",
+        type=str,
+        default=None,
+        help="Path to input audio (.wav) for S2V speech-to-video mode",
+    )
+    parser.add_argument(
+        "--model-type",
+        type=str,
+        default=None,
+        choices=["t2v", "i2v", "ti2v", "s2v"],
+        help="Override auto-detected model type (default: from config.json)",
     )
     parser.add_argument(
         "--negative-prompt",
@@ -930,6 +1351,15 @@ def main():
         action="store_true",
         help="Print per-temporal-position latent statistics after denoising (diagnostic)",
     )
+    parser.add_argument(
+        "--audio-scale",
+        type=float,
+        default=1.0,
+        help="S2V only: multiplier on the audio-cross-attn residual "
+        "(kijai parity, see model.py L707/797/855). Default 1.0. "
+        "Increase (e.g. 1.5, 2.5) to strengthen lipsync amplitude when the "
+        "mouth barely moves relative to phoneme count.",
+    )
     args = parser.parse_args()
 
     # Parse guide scale
@@ -948,6 +1378,13 @@ def main():
         if not lora_list:
             return None
         return [(path, float(strength)) for path, strength in lora_list]
+
+    # ---------- S2V dispatch ----------
+    # If user passed --audio or --model-type s2v, route to the S2V pipeline
+    # (Phase 1: loads the model, then raises NotImplementedError from forward).
+    if args.audio is not None or args.model_type == "s2v":
+        _dispatch_s2v(args)
+        return
 
     generate_video(
         model_dir=args.model_dir,

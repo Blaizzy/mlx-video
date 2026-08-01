@@ -26,6 +26,144 @@ def rope_params(max_seq_len: int, dim: int, theta: float = 10000.0) -> mx.array:
     return mx.array(np.stack([cos_freqs, sin_freqs], axis=-1))
 
 
+def rope_cos_sin_at_positions(
+    positions,
+    dim: int,
+    theta: float = 10000.0,
+    dtype: mx.Dtype = mx.float32,
+) -> tuple:
+    """Compute (cos, sin) RoPE frequencies at arbitrary (possibly negative) positions.
+
+    Args:
+        positions: 1-D mx.array or Python list of positions.
+        dim: per-axis RoPE frequency dim (must be even). Each pair (cos, sin)
+            corresponds to a single "complex" element, so returned tensors have
+            width dim // 2.
+        theta: RoPE theta base (same as rope_params).
+        dtype: output dtype.
+
+    Returns:
+        (cos, sin) each of shape (N, dim // 2).
+    """
+    assert dim % 2 == 0
+    if not isinstance(positions, mx.array):
+        positions = mx.array(list(positions), dtype=mx.float32)
+    else:
+        positions = positions.astype(mx.float32)
+
+    # Compute inverse frequencies in float64 (as in rope_params) for precision.
+    inv_freq_np = 1.0 / np.power(
+        theta, np.arange(0, dim, 2, dtype=np.float64) / dim
+    )
+    inv_freq = mx.array(inv_freq_np.astype(np.float32))
+    angles = positions[:, None] * inv_freq[None, :]  # (N, dim // 2)
+    return mx.cos(angles).astype(dtype), mx.sin(angles).astype(dtype)
+
+
+def rope_precompute_cos_sin_segments(
+    segments,
+    freqs: mx.array,
+    dtype: mx.Dtype = mx.float32,
+    theta: float = 10000.0,
+) -> tuple:
+    """Precompute (cos, sin) for a heterogeneous multi-segment sequence.
+
+    Used for S2V, where the sequence is
+        [noise (T=[0..F-1] x [0..H-1] x [0..W-1]),
+         ref   (T=[t_ref]      x [0..H-1] x [0..W-1]),
+         motion_post   (T=[-1] x [0..H-1]     x [0..W-1]),
+         motion_2x     (T=[-3] x [0..H_2x-1]  x [0..W_2x-1]),
+         motion_4x     (T=[-19..-16] x [0..H_4x-1] x [0..W_4x-1])]
+
+    Each segment carries its own list of temporal indices (may be negative and
+    non-contiguous) and an (H, W) spatial grid. Spatial indices start at 0.
+
+    Args:
+        segments: list of dicts with keys::
+            "t_indices" : Sequence[int] or mx.array — temporal positions.
+            "h"         : int             — height patches for this segment.
+            "w"         : int             — width  patches for this segment.
+            Optional::
+            "h_start"   : int             — spatial-height offset (default 0).
+            "w_start"   : int             — spatial-width  offset (default 0).
+        freqs: precomputed (max_seq_len, half_d, 2) freqs table — only the
+            shape's half_d is used to derive the (d_t, d_h, d_w) axis split.
+        dtype: output dtype for cos/sin.
+        theta: RoPE theta base (must match rope_params).
+
+    Returns:
+        (cos_f, sin_f) each of shape (total_seq, 1, half_d) where
+        total_seq = sum(len(t_indices_i) * h_i * w_i over segments).
+    """
+    half_d = freqs.shape[1]
+    d_t = half_d - 2 * (half_d // 3)
+    d_h = half_d // 3
+    d_w = half_d // 3
+
+    all_cos = []
+    all_sin = []
+
+    for seg in segments:
+        t_indices = seg["t_indices"]
+        h = int(seg["h"])
+        w = int(seg["w"])
+        h_start = int(seg.get("h_start", 0))
+        w_start = int(seg.get("w_start", 0))
+
+        if not isinstance(t_indices, mx.array):
+            t_indices_arr = mx.array(list(t_indices), dtype=mx.float32)
+        else:
+            t_indices_arr = t_indices.astype(mx.float32)
+        F_seg = int(t_indices_arr.shape[0])
+
+        # Temporal cos/sin for arbitrary (possibly negative) positions.
+        cos_t_1d, sin_t_1d = rope_cos_sin_at_positions(
+            t_indices_arr, d_t * 2, theta=theta, dtype=dtype
+        )  # (F_seg, d_t)
+
+        # Spatial: rows h_start..h_start+h-1 (non-negative in practice).
+        h_positions = mx.arange(h_start, h_start + h, dtype=mx.float32)
+        w_positions = mx.arange(w_start, w_start + w, dtype=mx.float32)
+        cos_h_1d, sin_h_1d = rope_cos_sin_at_positions(
+            h_positions, d_h * 2, theta=theta, dtype=dtype
+        )  # (h, d_h)
+        cos_w_1d, sin_w_1d = rope_cos_sin_at_positions(
+            w_positions, d_w * 2, theta=theta, dtype=dtype
+        )  # (w, d_w)
+
+        # Broadcast each axis to (F_seg, h, w, *) and concat along last dim.
+        cos_t = mx.broadcast_to(
+            cos_t_1d.reshape(F_seg, 1, 1, d_t), (F_seg, h, w, d_t)
+        )
+        cos_h = mx.broadcast_to(
+            cos_h_1d.reshape(1, h, 1, d_h), (F_seg, h, w, d_h)
+        )
+        cos_w = mx.broadcast_to(
+            cos_w_1d.reshape(1, 1, w, d_w), (F_seg, h, w, d_w)
+        )
+        cos_seg = mx.concatenate([cos_t, cos_h, cos_w], axis=-1)
+        cos_seg = cos_seg.reshape(F_seg * h * w, 1, half_d)
+
+        sin_t = mx.broadcast_to(
+            sin_t_1d.reshape(F_seg, 1, 1, d_t), (F_seg, h, w, d_t)
+        )
+        sin_h = mx.broadcast_to(
+            sin_h_1d.reshape(1, h, 1, d_h), (F_seg, h, w, d_h)
+        )
+        sin_w = mx.broadcast_to(
+            sin_w_1d.reshape(1, 1, w, d_w), (F_seg, h, w, d_w)
+        )
+        sin_seg = mx.concatenate([sin_t, sin_h, sin_w], axis=-1)
+        sin_seg = sin_seg.reshape(F_seg * h * w, 1, half_d)
+
+        all_cos.append(cos_seg)
+        all_sin.append(sin_seg)
+
+    cos_f = mx.concatenate(all_cos, axis=0) if len(all_cos) > 1 else all_cos[0]
+    sin_f = mx.concatenate(all_sin, axis=0) if len(all_sin) > 1 else all_sin[0]
+    return cos_f, sin_f
+
+
 def rope_apply(
     x: mx.array,
     grid_sizes: list,
@@ -45,9 +183,12 @@ def rope_apply(
 
     if precomputed_cos_sin is not None:
         cos_f, sin_f = precomputed_cos_sin
+        # For plain T2V/I2V rope_cos_sin covers exactly F*H*W tokens; for S2V
+        # multi-segment rope it covers the full concatenated [noise, ref, motion]
+        # sequence. Derive seq_len from cos_f so both cases work.
+        seq_len = int(cos_f.shape[0])
         # Check if all batch elements have the same grid (common for CFG B=2)
         f0, h0, w0 = grid_sizes[0]
-        seq_len = f0 * h0 * w0
         all_same_grid = (
             all(grid_sizes[i] == grid_sizes[0] for i in range(1, b)) if b > 1 else True
         )

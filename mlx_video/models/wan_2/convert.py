@@ -162,6 +162,62 @@ def sanitize_wan_transformer_weights(
     return sanitized
 
 
+def sanitize_wan_s2v_weights(
+    weights: Dict[str, mx.array],
+) -> Dict[str, mx.array]:
+    """Convert a Wan 2.2 S2V-14B PyTorch state dict to MLX WanS2VModel keys.
+
+    Runs the base :func:`sanitize_wan_transformer_weights` for the shared
+    T2V-compatible tensors (blocks, patch/text/time/head), then handles the
+    165 S2V-specific keys:
+
+        audio_injector.injector.<N>.{q,k,v,o,norm_q,norm_k}.*   -> unchanged
+        audio_injector.injector_adain_layers.<N>.linear.*       -> unchanged
+        casual_audio_encoder.*                                  -> unchanged
+        frame_packer.{proj,proj_2x,proj_4x}.{weight,bias}       -> unchanged
+                                                                   (Conv3d
+                                                                   layout kept
+                                                                   raw for the
+                                                                   Phase-1 stub)
+        cond_encoder.{weight,bias}                              -> unchanged
+        trainable_cond_mask.weight                              -> unchanged
+
+    The upstream typo ``casual_audio_encoder`` (instead of ``causal``) is
+    preserved on both sides. If a future release fixes the typo, the sanitizer
+    will alias ``causal_*`` -> ``casual_*`` automatically.
+    """
+    # Split into base-transformer keys vs S2V-only keys, so we can invoke the
+    # existing T2V sanitizer without triggering its "unconsumed keys" warning
+    # on legitimately-S2V keys.
+    s2v_prefixes = (
+        "audio_injector.",
+        "casual_audio_encoder.",
+        "causal_audio_encoder.",  # future-proofing against the upstream typo fix
+        "frame_packer.",
+        "cond_encoder.",
+        "trainable_cond_mask.",
+    )
+    base_weights = {}
+    s2v_weights = {}
+    for k, v in weights.items():
+        if any(k.startswith(p) for p in s2v_prefixes):
+            s2v_weights[k] = v
+        else:
+            base_weights[k] = v
+
+    sanitized = sanitize_wan_transformer_weights(base_weights)
+
+    for key, value in s2v_weights.items():
+        new_key = key
+        # Alias the future-fixed spelling to the shipped-with-typo module name.
+        if new_key.startswith("causal_audio_encoder."):
+            new_key = "casual_audio_encoder." + new_key[len("causal_audio_encoder."):]
+        # Every other S2V key already matches the MLX module attribute path.
+        sanitized[new_key] = value
+
+    return sanitized
+
+
 def sanitize_wan_t5_weights(weights: Dict[str, mx.array]) -> Dict[str, mx.array]:
     """Convert Wan2.2 T5 encoder weight keys to MLX T5Encoder structure.
 
@@ -368,7 +424,28 @@ def convert_wan_checkpoint(
 
     is_dual = (checkpoint_dir / "low_noise_model").exists()
 
-    if is_dual:
+    # Detect S2V: released as a *single* transformer split across 4 safetensors
+    # shards, alongside diffusion_pytorch_model.safetensors.index.json and a
+    # config.json with model_type=="s2v".
+    is_s2v = False
+    src_cfg_path = checkpoint_dir / "config.json"
+    if src_cfg_path.exists() and not is_dual:
+        try:
+            with open(src_cfg_path) as _f:
+                _src_cfg = json.load(_f)
+            is_s2v = _src_cfg.get("model_type") == "s2v"
+        except Exception:
+            pass
+
+    if is_s2v:
+        print("Converting Wan2.2 S2V transformer (single model, S2V-14B)...")
+        weights = load_safetensors_weights(str(checkpoint_dir))
+        weights = sanitize_wan_s2v_weights(weights)
+        weights = {k: v.astype(target_dtype) for k, v in weights.items()}
+        out_path = output_dir / "model.safetensors"
+        mx.save_safetensors(str(out_path), weights)
+        print(f"  Saved {len(weights)} weight tensors to {out_path}")
+    elif is_dual:
         # Wan2.2: Convert dual transformer models
         low_noise_path = checkpoint_dir / "low_noise_model"
         if low_noise_path.exists():
@@ -415,6 +492,8 @@ def convert_wan_checkpoint(
 
     def _detect_config():
         """Detect config from source config.json or transformer weight shapes."""
+        if is_s2v:
+            return WanModelConfig.wan22_s2v_14b()
         if is_dual:
             # Check source config.json for model_type (I2V vs T2V)
             src_cfg_path = checkpoint_dir / "high_noise_model" / "config.json"
