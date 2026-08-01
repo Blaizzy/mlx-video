@@ -108,3 +108,82 @@ Plus: verify the linearity assumption at HIGH code density (dense 262 K slots)
 by comparing `op(code)` against `w0 + my_reconstruct(code)`. If they differ
 by more than fp16 noise, the op has hidden non-linear structure that would
 need one more targeted probe.
+
+---
+
+## §3 — SOLVED (2026-08-01): pairwise spatial-overlap interaction
+
+**Findings (from `modal_joint_hypothesis_probes.py` + `modal_pair_grouping_probe.py`):**
+
+The joint decode within one K=1 layer is EXACTLY
+
+```
+delta(codes) = sum_k solo_k(codes[k]) + sum_{(i,j) : supp(k=i) ∩ supp(k=j) ≠ ∅} pair_{i,j}(codes[i], codes[j])
+```
+
+Rules verified empirically to numerical zero (float rounding):
+
+1. **Cross-K-layer additivity** (control): for k_i ∈ [0..15], k_j ∈ [16..31],
+   the pair residual `d_AB - d_A - d_B` is exactly 0 for all tested values.
+   → K-layer 1 (slots 0..15) and K-layer 2 (slots 16..31) are independent
+   additive residual layers, as originally hypothesized.
+
+2. **Pair non-additivity is fully predicted by spatial support overlap.**
+   The 16 slots' spatial-support patterns fall into 4 row-classes (indexed by
+   `k % 4`) and 4 col-classes (`k // 4`, plus expansion for `k%4 == 2`). Two
+   slots interact iff their supports share at least one (r, c) pixel:
+
+   | k%4 pair | Row overlap? |
+   |---|---|
+   | (0,1), (0,3), (1,2), (2,3) | Yes (4 rows each) |
+   | (0,2), (1,3) | No |
+
+   Combined with the col rule (k_i // 4 == k_j // 4 to share cols, or `k%4=2` cases
+   which have extended col support), the exact non-additive pair set within one
+   K-layer is 15 pairs (both K-layers share the same structure, translated).
+
+3. **Only pairwise interactions — no 3-way or higher.** Probe P3 confirmed the
+   3-way Möbius residual `d_ABC - (d_AB+d_AC+d_BC) + (d_A+d_B+d_C)` is exactly
+   zero for four sampled triples including ones with multiple pair overlaps.
+
+4. **Pair-decode structure per interacting pair** (from dense 32×32 sweep of
+   pair (0,1)): effective rank ~23 in the unfolded (v0*v1)×spatial matrix;
+   per-pixel rank ranges from 1 (non-overlap pixels — depend on only one code)
+   to ≤ 14 (overlap pixels — cross term is nontrivial low-rank structure).
+
+**Hypothesis discrimination result:**
+
+- ✅ **H1 (bilinear cross-terms)** — CORRECT for the interaction structure.
+  The 3-way residual being zero rules out higher-order terms; the pair-decode
+  factors reasonably as solo terms plus low-rank cross terms.
+- ❌ H2 (VQ-VI, all 16 codes → one lookup): would produce full-rank joint
+  structure, contradicts observed pairwise-only interaction.
+- ❌ H3 (16-way tensor decomposition): overspecified; the observed structure is
+  strictly pairwise, so a 2-way tensor decomp per overlapping pair suffices.
+- ❌ H4 (softmax mixture): codes are int16 discrete indices, not weights, and
+  no convex-hull constraints observed.
+- ❌ H5 (small dense codebook): incompatible with the per-slot 65536-index
+  sweep having distinct outputs at all values.
+
+**Extraction plan (Step 3):**
+
+- For each K-layer, for each slot k ∈ [0..15]: extract solo_k(v) for
+  v ∈ [0, 65536) — 16 × 65536 × 16 fp16 sparse tiles. Already done in
+  `codebooks/layout_v2/compact.pkl` (120 MB, `smart_probe`).
+- For each of 15 interacting pairs (i, j) per K-layer, extract the "cross"
+  term as follows: sweep v_i with v_j = fixed non-zero (say v_j = 1) to get
+  `cross(v_i, 1)`; sweep v_j with v_i = 1 to get `cross(1, v_j)`; fit low-rank
+  factorization per overlap pixel (rank ≤ 4 suffices per per-pixel analysis).
+- Cross-term storage: ~4 MB per pair × 15 pairs × 2 K-layers = 120 MB.
+- Solo + cross ≈ 240 MB total per (in_f, out_f, K) — well within budget.
+
+**Verify** by running MLX reconstruction and comparing to `op(real_expert_code)`
+extracted via Modal on 10 randomly-picked experts across layers 0, 5, 20, 39.
+Max abs diff should be < 1e-2 (bf16 rounding tolerance).
+
+Both K variants (K=2 for gate_up, K=3 for down) share the same joint-lookup
+structure — only the number of K-layers differs. Extraction script and MLX
+implementation cover both K in the same code path.
+
+**Modal cost so far**: ~$0.10 total across the two probes (both finished in
+under 1s wall time on A10G).

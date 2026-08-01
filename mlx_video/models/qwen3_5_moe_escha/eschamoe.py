@@ -40,6 +40,39 @@ _CB_PATH = Path(__file__).parent / "codebooks" / "layout_v2" / "compact.pkl"
 _CB_CACHE: dict[tuple[int, str], mx.array] = {}
 
 
+# --- BASELINE_V2 WIRE-IN (auto-inserted) ---
+# See codebooks/wire_baseline_v2.py. `w0 = op(all_zeros_code, in_f, out_f, K)`
+# captured on the reference CUDA runtime; subtracting it isolates the
+# codebook sum from Escha's shape-dependent additive bias.
+_BASELINE_NPZ = Path(__file__).parent / "codebooks" / "baseline_v2.npz"
+_BASELINE_CACHE: dict[tuple[int, int, int], "mx.array"] = {}
+
+
+def _baseline_w0(in_features: int, out_features: int, K: int, dtype) -> "mx.array":
+    key = (int(in_features), int(out_features), int(K))
+    if key in _BASELINE_CACHE:
+        return _BASELINE_CACHE[key].astype(dtype)
+    if not _BASELINE_NPZ.exists():
+        raise FileNotFoundError(
+            f"baseline_v2.npz not found at {_BASELINE_NPZ}. "
+            f"Run codebooks/baseline_probe_colab.ipynb on a T4 and wire via "
+            f"codebooks/wire_baseline_v2.py."
+        )
+    import numpy as _np
+    with _np.load(_BASELINE_NPZ, allow_pickle=False) as npz:
+        want = f"in{in_features}_out{out_features}_K{K}"
+        match = [k for k in npz.files if k.endswith(f"__{want}")]
+        if not match:
+            raise KeyError(
+                f"baseline_v2.npz has no entry for {want}; "
+                f"present keys: {list(npz.files)}"
+            )
+        arr = mx.array(npz[match[0]].astype(_np.float32))
+    _BASELINE_CACHE[key] = arr
+    return arr.astype(dtype)
+# --- /BASELINE_V2 WIRE-IN ---
+
+
 def _load_codebook_dense(K: int, dtype: mx.Dtype = mx.bfloat16) -> mx.array:
     """Load the codebook for K in {2, 3}, densified to (k_max, 65536, 16, 16).
 
@@ -131,6 +164,7 @@ def escham_reconstruct(
     # Reassemble: (bi, 16, bj, 16) -> (in, out)
     per_block = per_block.transpose(0, 2, 1, 3)        # (bi, 16, bj, 16)
     w = per_block.reshape(in_features, out_features)
+    w = w + _baseline_w0(in_features, out_features, K, w.dtype)
     return w.astype(mx.float16)
 
 
