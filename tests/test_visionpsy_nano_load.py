@@ -110,4 +110,7 @@ def test_processor_and_prefill():
     # Basic well-formedness
     assert logits.shape[0] == 1
     assert logits.shape[-1] == cfg.lm_vocab_size
-    assert not np.any(np.isnan(np.asarray(logits[:, -1, :])))
+    # bf16 -> fp32 before numpy: numpy has no native bfloat16 dtype
+    last_fp32 = np.asarray(logits[:, -1, :].astype(mx.float32))
+    assert not np.any(np.isnan(last_fp32))
+    assert float(np.abs(last_fp32).max()) > 0
