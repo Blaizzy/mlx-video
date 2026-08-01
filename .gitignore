@@ -8,3 +8,14 @@ config.json
 **.pyc
 __pycache__/*
 *.egg-info/*
+
+# Escha extraction working directories
+mlx_video/models/qwen3_5_moe_escha/codebooks/.escha_wheel_cache/
+mlx_video/models/qwen3_5_moe_escha/codebooks/*.npy
+mlx_video/models/qwen3_5_moe_escha/codebooks/*.pkl
+mlx_video/models/qwen3_5_moe_escha/codebooks/hf_cache/
+mlx_video/models/qwen3_5_moe_escha/codebooks/*.bak
+
+# Session dirs
+mlx-models/
+logs/
