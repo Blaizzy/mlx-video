@@ -25,6 +25,22 @@ class WanModelConfig(BaseModelConfig):
     cross_attn_norm: bool = True
     eps: float = 1e-6
 
+    # -------- Wan 2.2 S2V-specific (unused for T2V/I2V/TI2V) --------
+    audio_dim: int = 0  # wav2vec2 feature dim (1024 for xls-r), 0 disables audio
+    num_audio_token: int = 4  # tokens per video frame from CausalAudioEncoder
+    audio_inject_layers: Tuple[int, ...] = ()  # transformer blocks to inject audio
+    cond_dim: int = 0  # pose/overlay conditioning channels (16 for S2V), 0 disables
+    enable_adain: bool = False  # AdaLayerNorm on audio injector inputs
+    adain_mode: str = "attn_norm"  # "attn_norm" is the released S2V setting
+    enable_framepack: bool = False  # motion-history framepack module
+    framepack_drop_mode: str = "padd"  # "padd" (released) or "drop"
+    enable_motioner: bool = False  # MotionerTransformers (mutually exclusive w/ framepack)
+    motion_token_num: int = 1024  # only used if enable_motioner=True
+    trainable_token_pos_emb: bool = False  # only used if enable_motioner=True
+    add_last_motion: bool = True
+    zero_timestep: bool = False  # ref/motion tokens use t=0 modulation
+    zero_init: bool = False  # zero-init output projections at construction
+
     # VAE
     vae_stride: Tuple[int, int, int] = (4, 8, 8)
     vae_z_dim: int = 16
@@ -103,6 +119,46 @@ class WanModelConfig(BaseModelConfig):
             boundary=0.900,
             sample_shift=5.0,
             sample_guide_scale=(3.5, 3.5),
+            max_area=704 * 1280,
+        )
+
+    @classmethod
+    def wan22_s2v_14b(cls) -> "WanModelConfig":
+        """Wan2.2 Speech-to-Video 14B (audio-driven talking-head).
+
+        Single-model (not MoE). Adds wav2vec2 audio conditioning via
+        CausalAudioEncoder + AudioInjector cross-attention at 12 blocks,
+        plus reference-image and framepack motion-history tokens appended
+        to the transformer sequence.
+        """
+        return cls(
+            model_type="s2v",
+            model_version="2.2",
+            dim=5120,
+            ffn_dim=13824,
+            in_dim=16,
+            out_dim=16,
+            num_heads=40,
+            num_layers=40,
+            # S2V-specific
+            audio_dim=1024,
+            num_audio_token=4,
+            audio_inject_layers=(0, 4, 8, 12, 16, 20, 24, 27, 30, 33, 36, 39),
+            cond_dim=16,
+            enable_adain=True,
+            adain_mode="attn_norm",
+            enable_framepack=True,
+            framepack_drop_mode="padd",
+            enable_motioner=False,
+            add_last_motion=True,
+            zero_timestep=True,
+            zero_init=True,
+            # Inference (single-model, not MoE)
+            dual_model=False,
+            boundary=0.0,
+            sample_shift=5.0,
+            sample_steps=40,
+            sample_guide_scale=(4.5, 4.5),  # per official S2V pipeline
             max_area=704 * 1280,
         )
 
