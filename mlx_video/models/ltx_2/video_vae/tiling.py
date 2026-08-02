@@ -221,8 +221,13 @@ class TilingConfig:
             )
 
         if needs_temporal:
+            # 32 frames (not 64): with 512px spatial tiles, 64-frame temporal
+            # tiles push the Wan VAE Resample Conv2d input past ~2e9 elements,
+            # where MLX's Metal conv2d silently returns all zeros — tiles decode
+            # as flat gray with no error. 32-frame tiles keep every conv input
+            # under the threshold. See ml-explore/mlx#3979.
             temporal_config = TemporalTilingConfig(
-                tile_size_in_frames=64, tile_overlap_in_frames=24
+                tile_size_in_frames=32, tile_overlap_in_frames=24
             )
 
         return cls(spatial_config=spatial_config, temporal_config=temporal_config)
