@@ -27,6 +27,31 @@ from mlx_video.models.ltx_2.video_vae.sampling import DepthToSpaceUpsample
 from mlx_video.models.ltx_2.video_vae.tiling import TilingConfig, decode_with_tiling
 
 
+def sanitize_standalone_vae_weights(
+    weights: Dict[str, mx.array],
+) -> Dict[str, mx.array]:
+    """Normalize LTX-2.5's split VAE file to the converted MLX layout."""
+    sanitized = {}
+    for key, value in weights.items():
+        if key == "per_channel_statistics.mean-of-means":
+            sanitized["per_channel_statistics.mean"] = value
+            continue
+        if key == "per_channel_statistics.std-of-means":
+            sanitized["per_channel_statistics.std"] = value
+            continue
+        if not key.startswith("decoder."):
+            continue
+        new_key = key.removeprefix("decoder.")
+        if ".conv.weight" in new_key and value.ndim == 5:
+            value = mx.transpose(value, (0, 2, 3, 4, 1))
+        if ".conv.conv.weight" not in new_key:
+            new_key = new_key.replace(".conv.weight", ".conv.conv.weight")
+        if ".conv.conv.bias" not in new_key:
+            new_key = new_key.replace(".conv.bias", ".conv.conv.bias")
+        sanitized[new_key] = value
+    return sanitized
+
+
 def get_timestep_embedding(
     timesteps: mx.array,
     embedding_dim: int,
@@ -421,19 +446,33 @@ class LTX2VideoDecoder(nn.Module):
         model_path = Path(model_path)
         config_dict = {}
 
-        # Load config from directory
-        config_path = model_path / "config.json"
-        if config_path.exists():
-            with open(config_path) as f:
-                config_dict = json.load(f)
+        if model_path.is_file():
+            from safetensors import safe_open
 
-        # Load weights from directory
-        weight_files = sorted(model_path.glob("*.safetensors"))
+            weight_files = [model_path]
+            with safe_open(model_path, framework="numpy") as f:
+                metadata = f.metadata() or {}
+            if raw_config := metadata.get("config"):
+                config_dict = json.loads(raw_config).get("vae", {})
+        else:
+            config_path = model_path / "config.json"
+            if config_path.exists():
+                with open(config_path) as f:
+                    config_dict = json.load(f)
+            weight_files = sorted(model_path.glob("*.safetensors"))
+
         if not weight_files:
             raise FileNotFoundError(f"No safetensors files found in {model_path}")
         weights = {}
         for wf in weight_files:
             weights.update(mx.load(str(wf)))
+
+        # LTX-2.5 publishes each component as a standalone safetensors file. Its
+        # VAE keys are rooted at ``decoder.``/``encoder.`` rather than ``vae.``.
+        # Normalize that layout to the existing converted-directory layout so
+        # block inference and the decoder implementation remain shared.
+        if any(key.startswith("decoder.") for key in weights):
+            weights = sanitize_standalone_vae_weights(weights)
 
         # Infer block structure from weights
         decoder_blocks = cls._infer_blocks(weights)

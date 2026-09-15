@@ -35,6 +35,7 @@ class TransformerArgsPreprocessor:
         rope_type: LTXRopeType,
         double_precision_rope: bool = False,
         prompt_adaln: Optional[AdaLayerNormSingle] = None,
+        keyframes_embedding: Optional[mx.array] = None,
     ):
         self.patchify_proj = patchify_proj
         self.adaln = adaln
@@ -48,6 +49,7 @@ class TransformerArgsPreprocessor:
         self.positional_embedding_theta = positional_embedding_theta
         self.rope_type = rope_type
         self.double_precision_rope = double_precision_rope
+        self.keyframes_embedding = keyframes_embedding
 
     def _prepare_timestep(
         self,
@@ -145,6 +147,12 @@ class TransformerArgsPreprocessor:
 
     def prepare(self, modality: Modality) -> TransformerArgs:
         x = self.patchify_proj(modality.latent)
+        if self.keyframes_embedding is not None and modality.keyframes_mask is not None:
+            x = (
+                x
+                + modality.keyframes_mask[..., None].astype(x.dtype)
+                * self.keyframes_embedding
+            )
         timestep, embedded_timestep = self._prepare_timestep(
             modality.timesteps, x.shape[0], hidden_dtype=x.dtype
         )
@@ -217,6 +225,7 @@ class MultiModalTransformerArgsPreprocessor:
         av_ca_timestep_scale_multiplier: int,
         double_precision_rope: bool = False,
         prompt_adaln: Optional[AdaLayerNormSingle] = None,
+        keyframes_embedding: Optional[mx.array] = None,
     ):
         self.simple_preprocessor = TransformerArgsPreprocessor(
             patchify_proj=patchify_proj,
@@ -231,6 +240,7 @@ class MultiModalTransformerArgsPreprocessor:
             rope_type=rope_type,
             double_precision_rope=double_precision_rope,
             prompt_adaln=prompt_adaln,
+            keyframes_embedding=keyframes_embedding,
         )
         self.cross_scale_shift_adaln = cross_scale_shift_adaln
         self.cross_gate_adaln = cross_gate_adaln
@@ -317,6 +327,8 @@ class LTXModel(nn.Module):
             self.num_attention_heads = config.num_attention_heads
             self.inner_dim = config.inner_dim
             self._init_video(config)
+            if config.use_keyframes_abs_pos_embedding:
+                self.keyframes_abs_pos_embedding = mx.zeros((1, self.inner_dim))
 
         if config.model_type.is_audio_enabled():
             self.audio_positional_embedding_max_pos = (
@@ -348,7 +360,7 @@ class LTXModel(nn.Module):
     def _init_video(self, config: LTXModelConfig) -> None:
         self.patchify_proj = nn.Linear(config.in_channels, self.inner_dim, bias=True)
 
-        adaln_coefficient = 9 if config.has_prompt_adaln else 6
+        adaln_coefficient = 9 if config.cross_attention_adaln else 6
         self.adaln_single = AdaLayerNormSingle(
             self.inner_dim, embedding_coefficient=adaln_coefficient
         )
@@ -372,7 +384,7 @@ class LTXModel(nn.Module):
             config.audio_in_channels, self.audio_inner_dim, bias=True
         )
 
-        audio_adaln_coefficient = 9 if config.has_prompt_adaln else 6
+        audio_adaln_coefficient = 9 if config.cross_attention_adaln else 6
         self.audio_adaln_single = AdaLayerNormSingle(
             self.audio_inner_dim, embedding_coefficient=audio_adaln_coefficient
         )
@@ -440,6 +452,9 @@ class LTXModel(nn.Module):
                 av_ca_timestep_scale_multiplier=config.av_ca_timestep_scale_multiplier,
                 double_precision_rope=config.double_precision_rope,
                 prompt_adaln=getattr(self, "prompt_adaln_single", None),
+                keyframes_embedding=getattr(
+                    self, "keyframes_abs_pos_embedding", None
+                ),
             )
             self.audio_args_preprocessor = MultiModalTransformerArgsPreprocessor(
                 patchify_proj=self.audio_patchify_proj,
@@ -474,6 +489,9 @@ class LTXModel(nn.Module):
                 rope_type=config.rope_type,
                 double_precision_rope=config.double_precision_rope,
                 prompt_adaln=getattr(self, "prompt_adaln_single", None),
+                keyframes_embedding=getattr(
+                    self, "keyframes_abs_pos_embedding", None
+                ),
             )
         elif config.model_type.is_audio_enabled():
             self.audio_args_preprocessor = TransformerArgsPreprocessor(
@@ -666,16 +684,30 @@ class LTXModel(nn.Module):
     @classmethod
     def from_pretrained(cls, model_path: Path, strict: bool = True) -> "LTXModel":
         import json
+        from safetensors import safe_open
 
+        model_path = Path(model_path)
         config_dict = {}
-        with open(model_path / "config.json", "r") as f:
-            config_dict = json.load(f)
-        config = LTXModelConfig(**config_dict)
+        if model_path.is_file():
+            with safe_open(model_path, framework="numpy") as f:
+                metadata = f.metadata() or {}
+            config_dict = json.loads(metadata["config"])["transformer"]
+            config_dict["model_version"] = metadata.get("model_version")
+            config_dict["has_prompt_adaln"] = config_dict.get(
+                "cross_attention_adaln", False
+            )
+            config_dict["audio_ff_bias"] = config_dict.get("audio_ff_bias", True)
+            weight_files = [model_path]
+        else:
+            with open(model_path / "config.json", "r") as f:
+                config_dict = json.load(f)
+            weight_files = list(model_path.glob("*.safetensors"))
+        config = LTXModelConfig.from_dict(config_dict)
         model = cls(config)
 
         weights = {}
 
-        for weight_file in model_path.glob("*.safetensors"):
+        for weight_file in weight_files:
             weights.update(mx.load(str(weight_file)))
 
         sanitized = model.sanitize(weights)

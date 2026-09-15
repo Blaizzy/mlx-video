@@ -181,15 +181,25 @@ class AudioEncoder(nn.Module):
     def from_pretrained(cls, model_path: Path) -> "AudioEncoder":
         """Load audio encoder from pretrained weights."""
         import json
+        from safetensors import safe_open
 
         from mlx_video.models.ltx_2.config import AudioEncoderModelConfig
 
         model_path = Path(model_path)
-        config = AudioEncoderModelConfig.from_dict(
-            json.load(open(model_path / "config.json"))
-        )
+        if model_path.is_file():
+            with safe_open(model_path, framework="numpy") as f:
+                metadata = f.metadata() or {}
+            config_dict = json.loads(metadata["config"])["audio_vae"]["model"][
+                "params"
+            ]["ddconfig"]
+            weights = mx.load(str(model_path))
+        else:
+            config_dict = json.load(open(model_path / "config.json"))
+            weights = mx.load(str(model_path / "model.safetensors"))
+        config = AudioEncoderModelConfig.from_dict(config_dict)
         encoder = cls(config)
-        weights = mx.load(str(model_path / "model.safetensors"))
+        if model_path.is_file():
+            weights = encoder.sanitize(weights)
         encoder.load_weights(list(weights.items()), strict=True)
         return encoder
 
@@ -409,15 +419,25 @@ class AudioDecoder(nn.Module):
     def from_pretrained(cls, model_path: Path) -> "AudioDecoder":
         """Load audio VAE decoder from pretrained model."""
         import json
+        from safetensors import safe_open
 
         from mlx_video.models.ltx_2.config import AudioDecoderModelConfig
 
-        config = AudioDecoderModelConfig.from_dict(
-            json.load(open(model_path / "config.json"))
-        )
+        model_path = Path(model_path)
+        if model_path.is_file():
+            with safe_open(model_path, framework="numpy") as f:
+                metadata = f.metadata() or {}
+            config_dict = json.loads(metadata["config"])["audio_vae"]["model"][
+                "params"
+            ]["ddconfig"]
+            weights = mx.load(str(model_path))
+        else:
+            config_dict = json.load(open(model_path / "config.json"))
+            weights = mx.load(str(model_path / "model.safetensors"))
+        config = AudioDecoderModelConfig.from_dict(config_dict)
         decoder = cls(config)
-        weights = mx.load(str(model_path / "model.safetensors"))
-        # weights = decoder.sanitize(weights)
+        if model_path.is_file():
+            weights = decoder.sanitize(weights)
         decoder.load_weights(list(weights.items()), strict=True)
         return decoder
 

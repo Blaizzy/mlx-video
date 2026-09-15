@@ -10,12 +10,23 @@ from huggingface_hub import snapshot_download
 from PIL import Image
 
 
-def get_model_path(model_repo: str):
+def get_model_path(model_repo: str, allow_patterns: list[str] | None = None):
     """Get or download LTX-2 model path."""
+    if Path(model_repo).exists():
+        return Path(model_repo)
+    if allow_patterns is not None:
+        print("Resolving selected LTX model weights...")
+        return Path(
+            snapshot_download(repo_id=model_repo, allow_patterns=allow_patterns)
+        )
     try:
-        if Path(model_repo).exists():
-            return Path(model_repo)
-        return Path(snapshot_download(repo_id=model_repo, local_files_only=True))
+        return Path(
+            snapshot_download(
+                repo_id=model_repo,
+                local_files_only=True,
+                allow_patterns=allow_patterns,
+            )
+        )
     except Exception:
         print("Downloading LTX-2 model weights...")
         return Path(
@@ -23,7 +34,7 @@ def get_model_path(model_repo: str):
                 repo_id=model_repo,
                 local_files_only=False,
                 resume_download=True,
-                allow_patterns=["*.safetensors", "*.json"],
+                allow_patterns=allow_patterns or ["*.safetensors", "*.json"],
             )
         )
 

@@ -424,17 +424,28 @@ class VideoEncoder(nn.Module):
             Loaded VideoEncoder instance
         """
         import json
+        from safetensors import safe_open
 
         from mlx_video.models.ltx_2.config import VideoEncoderModelConfig
 
-        # Load config
-        config_path = model_path / "config.json"
-        if config_path.exists():
-            with open(config_path) as f:
-                config_dict = json.load(f)
-            config = VideoEncoderModelConfig(**config_dict)
+        model_path = Path(model_path)
+        if model_path.is_file():
+            with safe_open(model_path, framework="numpy") as f:
+                metadata = f.metadata() or {}
+            config_dict = json.loads(metadata["config"])["vae"]
+            config_dict["out_channels"] = config_dict.get("latent_channels", 128)
+            config_dict["encoder_spatial_padding_mode"] = config_dict.get(
+                "spatial_padding_mode", "zeros"
+            )
+            config = VideoEncoderModelConfig.from_dict(config_dict)
         else:
-            config = VideoEncoderModelConfig()
+            config_path = model_path / "config.json"
+            if config_path.exists():
+                with open(config_path) as f:
+                    config_dict = json.load(f)
+                config = VideoEncoderModelConfig(**config_dict)
+            else:
+                config = VideoEncoderModelConfig()
 
         # Load weights
         weight_files = sorted(model_path.glob("*.safetensors"))
@@ -448,10 +459,30 @@ class VideoEncoder(nn.Module):
             for wf in weight_files:
                 weights.update(mx.load(str(wf)))
 
+        if any(key.startswith("encoder.") for key in weights):
+            standalone_weights = {}
+            for key, value in weights.items():
+                if key == "per_channel_statistics.mean-of-means":
+                    standalone_weights["per_channel_statistics.mean"] = value
+                    continue
+                if key == "per_channel_statistics.std-of-means":
+                    standalone_weights["per_channel_statistics.std"] = value
+                    continue
+                if not key.startswith("encoder."):
+                    continue
+                new_key = key.removeprefix("encoder.")
+                if "conv" in new_key.lower() and "weight" in new_key:
+                    if value.ndim == 5:
+                        value = mx.transpose(value, (0, 2, 3, 4, 1))
+                    elif value.ndim == 4:
+                        value = mx.transpose(value, (0, 2, 3, 1))
+                standalone_weights[new_key] = value
+            weights = standalone_weights
+
         # Create model, sanitize and load weights
         model = cls(config)
         weights = model.sanitize(weights)
-        model.load_weights(list(weights.items()), strict=False)
+        model.load_weights(list(weights.items()), strict=True)
         return model
 
 

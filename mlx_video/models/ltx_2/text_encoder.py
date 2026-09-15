@@ -1,4 +1,5 @@
 import functools
+import json
 import logging
 import math
 import re
@@ -216,6 +217,159 @@ class LanguageModel(nn.Module):
         language_model.load_weights(list(weights.items()), strict=False)
 
         return language_model
+
+
+class Gemma4LanguageModel(nn.Module):
+    """Adapter exposing Gemma 4 hidden states through the existing LTX API."""
+
+    def __init__(self, config: dict):
+        super().__init__()
+        from mlx_vlm.models.gemma4.language import LanguageModel as Gemma4Model
+        from mlx_vlm.models.gemma4_unified.config import TextConfig as Gemma4Config
+
+        self.config = Gemma4Config.from_dict(config["text_config"])
+        self.model = Gemma4Model(self.config)
+
+    def _attention_mask(self, attention_mask: mx.array, dtype: mx.Dtype) -> mx.array:
+        seq_len = attention_mask.shape[1]
+        causal = mx.tril(mx.ones((seq_len, seq_len), dtype=mx.bool_))
+        allowed = causal[None, :, :] & attention_mask.astype(mx.bool_)[:, None, :]
+        min_value = (
+            mx.finfo(dtype).min if dtype in (mx.float16, mx.bfloat16) else -1e9
+        )
+        return mx.where(
+            allowed[:, None, :, :],
+            mx.zeros((1,), dtype=dtype),
+            mx.array(min_value, dtype=dtype),
+        )
+
+    def __call__(
+        self,
+        inputs: mx.array,
+        input_embeddings: Optional[mx.array] = None,
+        attention_mask: Optional[mx.array] = None,
+        output_hidden_states: bool = False,
+        cache=None,
+    ):
+        inner = self.model.model
+        hidden = (
+            input_embeddings
+            if input_embeddings is not None
+            else inner.embed_tokens(inputs) * inner.embed_scale
+        )
+        states = [hidden] if output_hidden_states else []
+        mask = (
+            self._attention_mask(attention_mask, hidden.dtype)
+            if attention_mask is not None
+            else None
+        )
+        capture_ids = (
+            list(range(len(inner.layers) - 1)) if output_hidden_states else None
+        )
+        output = inner(
+            None,
+            inputs_embeds=hidden,
+            mask=mask,
+            cache=cache,
+            capture_layer_ids=capture_ids,
+            hidden_sink=states if output_hidden_states else None,
+        )
+        if output_hidden_states:
+            states.append(output)
+            return output, states
+        return self.model.logits_from_hidden(output)
+
+    @classmethod
+    def from_pretrained(cls, checkpoint_path: str | Path):
+        from safetensors import safe_open
+
+        checkpoint_path = Path(checkpoint_path)
+        with safe_open(checkpoint_path, framework="numpy") as f:
+            config = json.loads((f.metadata() or {})["gemma_config"])
+        model = cls(config)
+        weights = {
+            key: value
+            for key, value in mx.load(str(checkpoint_path)).items()
+            if key.startswith("model.")
+        }
+        model.model.load_weights(list(weights.items()), strict=True)
+        return model
+
+
+def load_packed_tokenizer(checkpoint_path: str | Path):
+    """Build the Hugging Face tokenizer embedded in an LTX-2.5 TE pack."""
+    from safetensors import safe_open
+    from tokenizers import Tokenizer
+    from transformers import PreTrainedTokenizerFast
+
+    with safe_open(checkpoint_path, framework="numpy") as f:
+        tokenizer_json = f.get_tensor("tokenizer_json").tobytes()
+        tokenizer_config = json.loads(
+            f.get_tensor("hf_asset__tokenizer_config.json").tobytes()
+        )
+        chat_template = (
+            f.get_tensor("hf_asset__chat_template.jinja").tobytes().decode()
+        )
+
+    ignored = {
+        "tokenizer_class",
+        "auto_map",
+        "model_max_length",
+        "backend",
+        "is_local",
+        "local_files_only",
+        "processor_class",
+        "added_tokens_decoder",
+    }
+    kwargs = {k: v for k, v in tokenizer_config.items() if k not in ignored}
+    kwargs.setdefault("chat_template", chat_template)
+    return PreTrainedTokenizerFast(
+        tokenizer_object=Tokenizer.from_buffer(tokenizer_json),
+        model_max_length=1024,
+        **kwargs,
+    )
+
+
+def enhance_prompt_gemma4(
+    prompt: str,
+    model_repo: str,
+    image: str | None = None,
+    max_tokens: int = 600,
+    seed: int = 42,
+    verbose: bool = True,
+) -> str:
+    """Enhance an LTX-2.5 prompt with a separate generative Gemma 4 model."""
+    from mlx_vlm import generate, load
+    from mlx_vlm.prompt_utils import apply_chat_template
+
+    model, processor = load(model_repo)
+    prompt_name = (
+        "gemma4_i2v_system_prompt.txt" if image else "gemma4_t2v_system_prompt.txt"
+    )
+    messages = [
+        {"role": "system", "content": _load_system_prompt(prompt_name)},
+        {"role": "user", "content": f"user prompt: {prompt}"},
+    ]
+    formatted = apply_chat_template(
+        processor,
+        model.config,
+        messages,
+        num_images=1 if image else 0,
+    )
+    mx.random.seed(seed)
+    result = generate(
+        model=model,
+        processor=processor,
+        prompt=formatted,
+        image=image,
+        max_tokens=max_tokens,
+        temperature=0.0,
+        verbose=verbose,
+    )
+    enhanced = re.sub(r"^[^\w\s]+", "", result.text.strip())
+    del model
+    mx.clear_cache()
+    return enhanced
 
 
 class ConnectorAttention(nn.Module):
@@ -833,6 +987,43 @@ class LTX2TextEncoder(nn.Module):
         text_encoder_path: Optional[str] = "google/gemma-3-12b-it",
     ):
 
+        model_path = Path(model_path)
+        text_encoder_path = Path(text_encoder_path)
+
+        if text_encoder_path.is_file():
+            self.language_model = Gemma4LanguageModel.from_pretrained(
+                text_encoder_path
+            )
+
+            packed_weights = mx.load(str(text_encoder_path))
+            projection_weights = {
+                key.removeprefix("text_embedding_projection."): value
+                for key, value in packed_weights.items()
+                if key.startswith("text_embedding_projection.")
+            }
+            self._load_feature_extractors(projection_weights, is_reformatted=True)
+
+            transformer_files = sorted(
+                (model_path / "diffusion_models").glob(
+                    "*distilled-transformer*.safetensors"
+                )
+            )
+            if not transformer_files:
+                raise FileNotFoundError(
+                    f"No distilled transformer checkpoint found under {model_path}"
+                )
+            transformer_weights = mx.load(str(transformer_files[0]))
+            self._load_connector(
+                "video_embeddings_connector", transformer_weights, False
+            )
+            self._load_connector(
+                "audio_embeddings_connector", transformer_weights, False
+            )
+            self.processor = load_packed_tokenizer(text_encoder_path)
+            self.processor.padding_side = "left"
+            print("LTX-2.5 Gemma 4 text encoder loaded successfully")
+            return
+
         if Path(str(text_encoder_path)).joinpath("text_encoder").is_dir():
             text_encoder_path = str(Path(text_encoder_path) / "text_encoder")
 
@@ -1067,12 +1258,22 @@ class LTX2TextEncoder(nn.Module):
     @functools.cached_property
     def default_t2v_system_prompt(self) -> str:
         """Load the default T2V system prompt."""
-        return _load_system_prompt("gemma_t2v_system_prompt.txt")
+        prompt_name = (
+            "gemma4_t2v_system_prompt.txt"
+            if isinstance(self.language_model, Gemma4LanguageModel)
+            else "gemma_t2v_system_prompt.txt"
+        )
+        return _load_system_prompt(prompt_name)
 
     @functools.cached_property
     def default_i2v_system_prompt(self) -> str:
         """Load the default I2V system prompt."""
-        return _load_system_prompt("gemma_i2v_system_prompt.txt")
+        prompt_name = (
+            "gemma4_i2v_system_prompt.txt"
+            if isinstance(self.language_model, Gemma4LanguageModel)
+            else "gemma_i2v_system_prompt.txt"
+        )
+        return _load_system_prompt(prompt_name)
 
     def _clean_response(self, response: str) -> str:
         """Clean up the generated response."""
@@ -1087,6 +1288,12 @@ class LTX2TextEncoder(nn.Module):
         messages: List[Dict[str, str]],
     ) -> str:
         """Apply Gemma chat template to messages."""
+        if isinstance(self.language_model, Gemma4LanguageModel):
+            return self.processor.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
         # Gemma 3 chat template format
         formatted = ""
         for msg in messages:

@@ -16,15 +16,18 @@ uv pip install git+https://github.com/Blaizzy/mlx-video.git
 
 ## Supported Models
 
-- [**LTX-2**](https://huggingface.co/Lightricks/LTX-Video) — 19B parameter video generation model from Lightricks
+- [**LTX-2 / LTX-2.5**](https://huggingface.co/Lightricks/LTX-2.5) — 19B and 22B video generation models from Lightricks
 - [**Wan2.1**](https://github.com/Wan-Video/Wan2.1) — 1.3B / 14B parameter T2V models (single-model pipeline)
 - [**Wan2.2**](https://github.com/Wan-Video/Wan2.2) — T2V-14B, TI2V-5B, and I2V-14B models (dual-model pipeline)
 
 ## Features
 
-**LTX-2 / LTX-2.3**
+**LTX-2 / LTX-2.3 / LTX-2.5**
 - Text-to-Video (T2V), Image-to-Video (I2V), Audio-to-Video (A2V)
 - Audio-Video joint generation
+- Prompt-driven multishot generation
+- LTX-2.5 Diffusion Fidelity Rendering (DFR) with generated keyframes
+- Experimental LTX-2.5 diffusion video VAE with fused Metal attention
 - Multi-pipeline: distilled, dev, dev-two-stage, dev-two-stage-hq
 - 2x spatial upscaling for images and videos
 - Prompt enhancement via Gemma
@@ -47,6 +50,10 @@ uv pip install git+https://github.com/Blaizzy/mlx-video.git
 ```bash
 # Text-to-Video (distilled, fastest)
 uv run mlx_video.ltx_2.generate --prompt "Two dogs wearing sunglasses, cinematic, sunset" -n 97 --width 768
+
+# LTX-2.5 distilled T2V (accept the gated model terms first)
+uv run mlx_video.ltx_2.generate --model-repo Lightricks/LTX-2.5 \
+    --prompt "Ocean waves at golden hour" -n 121 --width 768 --height 512
 
 # Image-to-Video
 uv run mlx_video.ltx_2.generate --prompt "A person dancing" --image photo.jpg

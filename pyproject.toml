@@ -19,7 +19,8 @@ dependencies = [
     "tqdm",
     "opencv-python>=4.12.0.88",
     "Pillow>=10.3.0",
-    "mlx-vlm",
+    "mlx-vlm>=0.7.1",
+    "mlx-lm>=0.31.3",
     "rich>=14.2.0",
     "librosa>=0.10.0",
     "imageio>=2.37.2",
@@ -46,11 +47,15 @@ Repository = "https://github.com/Blaizzy/mlx-video"
 Issues = "https://github.com/Blaizzy/mlx-video/issues"
 
 [project.scripts]
+"mlx_video.generate" = "mlx_video.models.ltx_2.generate:main"
 "mlx_video.ltx_2.generate" = "mlx_video.models.ltx_2.generate:main"
 "mlx_video.wan_2.generate" = "mlx_video.models.wan_2.generate:main"
 
 [tool.setuptools.packages.find]
 include = ["mlx_video*"]
+
+[tool.setuptools.package-data]
+"mlx_video.models.ltx_2" = ["prompts/*.txt"]
 
 [tool.setuptools.dynamic]
 version = {attr = "mlx_video.version.__version__"}
@@ -59,4 +64,3 @@ version = {attr = "mlx_video.version.__version__"}
 dev = [
     "pytest",
 ]
-

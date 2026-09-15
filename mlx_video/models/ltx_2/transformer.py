@@ -22,6 +22,7 @@ class Modality:
     positional_embeddings: Optional[Tuple[mx.array, mx.array]] = None
     # Raw sigma value (scalar per batch) for prompt adaln (LTX-2.3)
     sigma: Optional[mx.array] = None
+    keyframes_mask: Optional[mx.array] = None
 
 
 @dataclass(frozen=True)
@@ -72,7 +73,7 @@ class BasicAVTransformerBlock(nn.Module):
                 context_dim=None,  # Self-attention
                 rope_type=rope_type,
                 norm_eps=norm_eps,
-                has_gate_logits=has_prompt_adaln,
+                has_gate_logits=video.apply_gated_attention,
             )
             self.attn2 = Attention(
                 query_dim=video.dim,
@@ -81,11 +82,11 @@ class BasicAVTransformerBlock(nn.Module):
                 dim_head=video.d_head,
                 rope_type=rope_type,
                 norm_eps=norm_eps,
-                has_gate_logits=has_prompt_adaln,
+                has_gate_logits=video.apply_gated_attention,
             )
-            self.ff = FeedForward(video.dim, dim_out=video.dim)
+            self.ff = FeedForward(video.dim, dim_out=video.dim, bias=video.ff_bias)
             # 9 params for LTX-2.3 (self-attn + cross-attn + FFN), 6 for LTX-2
-            num_ada_params = 9 if has_prompt_adaln else 6
+            num_ada_params = 9 if video.cross_attention_adaln else 6
             self.scale_shift_table = mx.zeros((num_ada_params, video.dim))
 
             if has_prompt_adaln:
@@ -100,7 +101,7 @@ class BasicAVTransformerBlock(nn.Module):
                 context_dim=None,
                 rope_type=rope_type,
                 norm_eps=norm_eps,
-                has_gate_logits=has_prompt_adaln,
+                has_gate_logits=audio.apply_gated_attention,
             )
             self.audio_attn2 = Attention(
                 query_dim=audio.dim,
@@ -109,10 +110,12 @@ class BasicAVTransformerBlock(nn.Module):
                 dim_head=audio.d_head,
                 rope_type=rope_type,
                 norm_eps=norm_eps,
-                has_gate_logits=has_prompt_adaln,
+                has_gate_logits=audio.apply_gated_attention,
             )
-            self.audio_ff = FeedForward(audio.dim, dim_out=audio.dim)
-            num_audio_ada_params = 9 if has_prompt_adaln else 6
+            self.audio_ff = FeedForward(
+                audio.dim, dim_out=audio.dim, bias=audio.ff_bias
+            )
+            num_audio_ada_params = 9 if audio.cross_attention_adaln else 6
             self.audio_scale_shift_table = mx.zeros((num_audio_ada_params, audio.dim))
 
             if has_prompt_adaln:
@@ -128,7 +131,7 @@ class BasicAVTransformerBlock(nn.Module):
                 dim_head=audio.d_head,
                 rope_type=rope_type,
                 norm_eps=norm_eps,
-                has_gate_logits=has_prompt_adaln,
+                has_gate_logits=video.apply_gated_attention,
             )
             # Video-to-Audio: Q from audio, K/V from video
             self.video_to_audio_attn = Attention(
@@ -138,7 +141,7 @@ class BasicAVTransformerBlock(nn.Module):
                 dim_head=audio.d_head,
                 rope_type=rope_type,
                 norm_eps=norm_eps,
-                has_gate_logits=has_prompt_adaln,
+                has_gate_logits=audio.apply_gated_attention,
             )
             # Scale-shift tables for cross-attention
             self.scale_shift_table_a2v_ca_audio = mx.zeros((5, audio.dim))

@@ -60,6 +60,9 @@ class TransformerConfig(BaseModelConfig):
     heads: int
     d_head: int
     context_dim: int
+    apply_gated_attention: bool = False
+    cross_attention_adaln: bool = False
+    ff_bias: bool = True
 
 
 @dataclass
@@ -97,6 +100,8 @@ class VideoVAEConfig(BaseModelConfig):
 
 @dataclass
 class LTXModelConfig(BaseModelConfig):
+
+    model_version: str | None = None
 
     # Model type
     model_type: LTXModelType = LTXModelType.AudioVideo
@@ -143,6 +148,11 @@ class LTXModelConfig(BaseModelConfig):
     # prompt_adaln_single, per-block prompt_scale_shift_table,
     # removal of caption_projection
     has_prompt_adaln: bool = False
+    apply_gated_attention: bool = False
+    cross_attention_adaln: bool = False
+    ff_bias: bool = True
+    audio_ff_bias: bool = True
+    use_keyframes_abs_pos_embedding: bool = False
 
     # VAE config
     vae_config: Optional[VideoVAEConfig] = None
@@ -161,6 +171,12 @@ class LTXModelConfig(BaseModelConfig):
         # frequencies_precision="float64", so double_precision_rope = True.
         if not self.has_prompt_adaln:
             self.double_precision_rope = False
+        else:
+            # Converted LTX-2.3 configs predate the explicit architecture flags.
+            # Prompt AdaLN in those checkpoints implies both gated attention and
+            # cross-attention AdaLN, as it does for LTX-2.5.
+            self.apply_gated_attention = True
+            self.cross_attention_adaln = True
 
         # Convert string enum values if loading from dict
         if isinstance(self.model_type, str):
@@ -189,6 +205,9 @@ class LTXModelConfig(BaseModelConfig):
             heads=self.num_attention_heads,
             d_head=self.attention_head_dim,
             context_dim=self.cross_attention_dim,
+            apply_gated_attention=self.apply_gated_attention,
+            cross_attention_adaln=self.cross_attention_adaln,
+            ff_bias=self.ff_bias,
         )
 
     def get_audio_config(self) -> Optional[TransformerConfig]:
@@ -200,6 +219,9 @@ class LTXModelConfig(BaseModelConfig):
             heads=self.audio_num_attention_heads,
             d_head=self.audio_attention_head_dim,
             context_dim=self.audio_cross_attention_dim,
+            apply_gated_attention=self.apply_gated_attention,
+            cross_attention_adaln=self.cross_attention_adaln,
+            ff_bias=self.audio_ff_bias,
         )
 
 

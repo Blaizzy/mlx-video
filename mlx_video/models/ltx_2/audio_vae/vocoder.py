@@ -667,23 +667,46 @@ class VocoderWithBWE(nn.Module):
 # ---------------------------------------------------------------------------
 
 
+def sanitize_split_vocoder_weights(weights: dict) -> dict:
+    """Normalize the vocoder section of an LTX-2.5 audio checkpoint."""
+    sanitized = {}
+    for key, value in weights.items():
+        if not key.startswith("vocoder."):
+            continue
+        new_key = key.removeprefix("vocoder.")
+        if new_key.endswith(".weight") and value.ndim == 3:
+            value = (
+                mx.transpose(value, (1, 2, 0))
+                if ".ups." in new_key
+                else mx.transpose(value, (0, 2, 1))
+            )
+        sanitized[new_key] = value
+    return sanitized
+
+
 def load_vocoder(model_path: Path) -> nn.Module:
     """Load vocoder from pretrained model directory.
 
     Automatically detects whether to load a simple Vocoder or VocoderWithBWE.
     """
     import json
+    from safetensors import safe_open
 
-    config_path = model_path / "config.json"
-    if not config_path.exists():
-        raise FileNotFoundError(f"No config.json found in {model_path}")
-
-    with open(config_path) as f:
-        config_dict = json.load(f)
-
-    weights = mx.load(str(model_path / "model.safetensors"))
-
-    has_bwe = config_dict.get("has_bwe_generator", False)
+    model_path = Path(model_path)
+    if model_path.is_file():
+        with safe_open(model_path, framework="numpy") as f:
+            metadata = f.metadata() or {}
+        config_dict = json.loads(metadata["config"])["vocoder"]
+        weights = sanitize_split_vocoder_weights(mx.load(str(model_path)))
+        has_bwe = "bwe" in config_dict
+    else:
+        config_path = model_path / "config.json"
+        if not config_path.exists():
+            raise FileNotFoundError(f"No config.json found in {model_path}")
+        with open(config_path) as f:
+            config_dict = json.load(f)
+        weights = mx.load(str(model_path / "model.safetensors"))
+        has_bwe = config_dict.get("has_bwe_generator", False)
 
     if has_bwe:
         return _load_vocoder_with_bwe(config_dict, weights)
