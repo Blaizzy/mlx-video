@@ -41,14 +41,12 @@ def load_video(path, start=0, end=None):
 
     frames = []
     idx = start
-    while True:
+    while end is None or idx < end:
         ret, frame = cap.read()
         if not ret:
             break
         frames.append(frame.astype(np.float32))
         idx += 1
-        if end and idx >= end:
-            break
     cap.release()
     return frames, fps, total
 
@@ -347,6 +345,8 @@ def main():
 
     print(f"Loading: {args.video}")
     frames, fps, total = load_video(args.video, args.start, args.end)
+    if not frames:
+        parser.error("no video frames in the requested range")
     h, w = frames[0].shape[:2]
     print(f"  → {len(frames)} frames, {fps:.1f} fps, {w}x{h}")
 
