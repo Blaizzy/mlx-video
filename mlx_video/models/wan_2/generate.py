@@ -64,6 +64,26 @@ def _best_output_size(w, h, dw, dh, max_area):
     return ow2, oh2
 
 
+def _validate_cfg_parallel(
+    world_size: int, cfg_disabled: bool, seed: int, is_dual: bool, is_i2v: bool
+) -> None:
+    """Raise ValueError if --cfg-parallel cannot run with these settings."""
+    if world_size != 2:
+        raise ValueError(
+            "--cfg-parallel needs exactly 2 processes (launch with mlx.launch)"
+        )
+    if cfg_disabled:
+        raise ValueError("--cfg-parallel needs classifier-free guidance (guide_scale > 1)")
+    if seed < 0:
+        raise ValueError(
+            "--cfg-parallel needs a fixed --seed so both processes start from the same noise"
+        )
+    if is_dual or is_i2v:
+        raise ValueError(
+            "--cfg-parallel currently supports single-model text-to-video only (Wan2.1 T2V)"
+        )
+
+
 def generate_video(
     model_dir: str,
     prompt: str,
@@ -85,6 +105,7 @@ def generate_video(
     no_compile: bool = False,
     trim_first_frames: int = 0,
     debug_latents: bool = False,
+    cfg_parallel: bool = False,
 ):
     """Generate video using Wan pipeline (supports T2V and I2V).
 
@@ -231,6 +252,14 @@ def generate_video(
         cfg_disabled = all(gs <= 1.0 for gs in guide_scale)
     else:
         cfg_disabled = guide_scale <= 1.0
+
+    if cfg_parallel:
+        group = mx.distributed.init()
+        rank = group.rank()
+        _validate_cfg_parallel(group.size(), cfg_disabled, seed, is_dual, is_i2v)
+    else:
+        rank = 0
+        group = None
 
     # Validate frame count
     assert (num_frames - 1) % 4 == 0, f"num_frames must be 4n+1, got {num_frames}"
@@ -495,6 +524,8 @@ def generate_video(
             context_emb = single_model.embed_text([context, context_null])
             mx.eval(context_emb)
             context_cfg = mx.concatenate([context_emb[0:1], context_emb[1:2]], axis=0)
+            if cfg_parallel:
+                context_local = context_cfg[rank:rank + 1]
 
     # Precompute cross-attention K/V caches (constant across all steps)
     if cfg_disabled:
@@ -511,14 +542,15 @@ def generate_video(
             cross_kv_high = high_noise_model.prepare_cross_kv(context_cfg_high)
             mx.eval(cross_kv_low, cross_kv_high)
         else:
-            cross_kv = single_model.prepare_cross_kv(context_cfg)
+            ctx_kv = context_local if cfg_parallel else context_cfg
+            cross_kv = single_model.prepare_cross_kv(ctx_kv)
             mx.eval(cross_kv)
 
     # Precompute RoPE frequencies (grid sizes are constant across all steps)
     f_grid = t_latent // patch_size[0]
     h_grid = h_latent // patch_size[1]
     w_grid = w_latent // patch_size[2]
-    if cfg_disabled:
+    if cfg_disabled or cfg_parallel:
         rope_grid_sizes = [(f_grid, h_grid, w_grid)]
     else:
         rope_grid_sizes = [(f_grid, h_grid, w_grid), (f_grid, h_grid, w_grid)]
@@ -563,6 +595,11 @@ def generate_video(
         )
         for m in models_to_compile:
             m._compiled = mx.compile(m)
+
+    # cfg-parallel: CPU barrier so both ranks enter the loop together; a rank waiting
+    # inside a GPU command buffer gets killed by macOS (GPU Timeout).
+    if cfg_parallel:
+        mx.eval(mx.distributed.all_sum(mx.array([1.0]), group=group, stream=mx.cpu))
 
     # Pre-convert timesteps to Python list to avoid .item() sync each step
     timestep_list = sched.timesteps.tolist()
@@ -649,18 +686,40 @@ def generate_video(
                 if not is_dual
                 else (context_cfg_high if timestep_val >= boundary else context_cfg_low)
             )
-            preds = _call(
-                [latents, latents],
-                t=t_batch,
-                context=ctx,
-                seq_len=seq_len,
-                cross_kv_caches=kv,
-                y=y_arg,
-                rope_cos_sin=rcs,
-            )
-            noise_pred_cond, noise_pred_uncond = preds[0], preds[1]
-            noise_pred = noise_pred_uncond + gs * (noise_pred_cond - noise_pred_uncond)
-            del noise_pred_cond, noise_pred_uncond, preds
+            if cfg_parallel:
+                preds = _call(
+                    [latents],
+                    t=mx.array([timestep_val]),
+                    context=context_local,
+                    seq_len=seq_len,
+                    cross_kv_caches=kv,
+                    y=None,
+                    rope_cos_sin=rcs,
+                )
+                # Finish the GPU work, then exchange on the CPU stream: a GPU command
+                # buffer waiting on the other Mac triggers a GPU Timeout.
+                local = preds[0][None]
+                mx.eval(local)
+                both = mx.distributed.all_gather(local, group=group, stream=mx.cpu)  # [2, C, T, H, W]
+                # Complete the exchange before queuing more GPU work, otherwise the
+                # GPU waits on a CPU event that waits on the network.
+                mx.eval(both)
+                noise_pred_cond, noise_pred_uncond = both[0], both[1]
+                noise_pred = noise_pred_uncond + gs * (noise_pred_cond - noise_pred_uncond)
+                del noise_pred_cond, noise_pred_uncond, preds, both
+            else:
+                preds = _call(
+                    [latents, latents],
+                    t=t_batch,
+                    context=ctx,
+                    seq_len=seq_len,
+                    cross_kv_caches=kv,
+                    y=y_arg,
+                    rope_cos_sin=rcs,
+                )
+                noise_pred_cond, noise_pred_uncond = preds[0], preds[1]
+                noise_pred = noise_pred_uncond + gs * (noise_pred_cond - noise_pred_uncond)
+                del noise_pred_cond, noise_pred_uncond, preds
 
         latents = sched.step(noise_pred[None], timestep_val, latents[None]).squeeze(0)
 
@@ -673,6 +732,12 @@ def generate_video(
         mx.eval(latents)
 
     print(f"{Colors.DIM}  Denoising: {time.time() - t3:.1f}s{Colors.RESET}")
+    if cfg_parallel and rank != 0:
+        print(
+            f"{Colors.DIM}  rank {rank}: denoising done, "
+            f"rank 0 decodes the video{Colors.RESET}"
+        )
+        return
 
     # Diagnostic: per-temporal-position latent statistics
     if debug_latents:
@@ -930,6 +995,12 @@ def main():
         action="store_true",
         help="Print per-temporal-position latent statistics after denoising (diagnostic)",
     )
+    parser.add_argument(
+        "--cfg-parallel",
+        action="store_true",
+        help="Split classifier-free guidance across 2 processes/Macs "
+        "(launch with mlx.launch, needs --seed)",
+    )
     args = parser.parse_args()
 
     # Parse guide scale
@@ -970,6 +1041,7 @@ def main():
         no_compile=args.no_compile,
         trim_first_frames=args.trim_first_frames,
         debug_latents=args.debug_latents,
+        cfg_parallel=args.cfg_parallel,
     )
 
 

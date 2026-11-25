@@ -162,6 +162,58 @@ python -m mlx_video.wan_2.generate \
 
 ![Poodles](examples/poodles-wan.gif)
 
+### Multi-Mac generation (CFG parallel)
+
+With classifier-free guidance, every denoising step runs the transformer twice (prompt and negative prompt) as a batch of 2. `--cfg-parallel` runs each half on a different Mac with a batch of 1 and exchanges the predictions every step with `mx.distributed.all_gather` (about 8 MB per step at 832x480, 81 frames). Each Mac loads the full model, so it does not reduce memory; it reduces time per video.
+
+Supported: single-model text-to-video (Wan2.1 T2V). Image-to-video and the Wan2.2 dual-expert models are rejected with an error for now. It requires guidance enabled (`--guide-scale` > 1), exactly 2 processes, and a fixed `--seed` (both Macs must start from the same noise).
+
+Requirements:
+
+- Two Macs with Thunderbolt 5 connected by a Thunderbolt 5 cable.
+- macOS 26.2 or later, RDMA enabled once on each Mac from Recovery (`rdma_ctl enable` in Terminal, then reboot).
+- The same Python environment with mlx-video installed and the converted model at the same path on both Macs.
+- SSH access from the first Mac to the second.
+
+See the [MLX distributed guide](https://ml-explore.github.io/mlx/build/html/usage/launching_distributed.html) for setting up JACCL/RDMA and the hostfile; `mlx.distributed_config` can generate it.
+
+Example hostfile (`hosts.json`, JACCL over RDMA):
+
+```json
+[
+  {"ssh": "mac1.local", "ips": ["169.254.x.1"], "rdma": [null, "rdma_en1"]},
+  {"ssh": "mac2.local", "ips": ["169.254.x.2"], "rdma": ["rdma_en1", null]}
+]
+```
+
+The RDMA device names come from `ibv_devices`. In our setup JACCL needed an IPv4 address on the Thunderbolt port itself (e.g. `en1`), not only on `bridge0`.
+
+Launch command:
+
+```bash
+mlx.launch --backend jaccl --hostfile hosts.json --python "$(which python)" -- \
+    -m mlx_video.models.wan_2.generate \
+    --model-dir wan21_mlx \
+    --prompt "A red fox walking through fresh snow in a pine forest" \
+    --width 832 --height 480 --num-frames 81 \
+    --seed 42 \
+    --cfg-parallel \
+    --output-path fox.mp4
+```
+
+Rank 0 decodes and saves the video; rank 1 exits after denoising. Use long-form flags after `--` (mlx.launch parses unknown short flags itself).
+
+Results (Wan2.1 T2V 1.3B, 832x480, 81 frames, 50 steps, guide 5.0, two MacBook Pro M4 Pro 24 GB over Thunderbolt 5 with JACCL; one run per prompt):
+
+| Prompt (seed) | 1 Mac | 2 Macs | Speedup (total) | Per step |
+|---|---|---|---|---|
+| Red fox in snow (42) | 97.5 min | 52.0 min | 1.87x | 111.2 s → 56.7 s (1.96x) |
+| Paper boat in the rain (7) | 95.3 min | 51.4 min | 1.86x | 108.0 s → 56.0 s (1.93x) |
+
+The output is not bit-identical to a single-Mac run (batch 1 vs batch 2 changes floating-point rounding, which accumulates over 50 steps) but is visually the same video (PSNR 36.9 and 37.3 dB against the single-Mac video). Text encoding and VAE decoding are not split, so the total speedup is a bit lower than the per-step one.
+
+Note for contributors: with steps of ~55 s, a GPU command buffer that waits on the other Mac is killed by macOS ("GPU Timeout"). The implementation finishes GPU work first, exchanges on the CPU stream, and evaluates the result before queuing more GPU work.
+
 ### Wan CLI Options
 
 | Option | Default | Description |
@@ -177,6 +229,7 @@ python -m mlx_video.wan_2.generate \
 | `--guide-scale` | from config | Guidance scale: float or `low,high` pair |
 | `--shift` | from config | Noise schedule shift |
 | `--seed` | -1 (random) | Random seed for reproducibility |
+| `--cfg-parallel` | off | Split classifier-free guidance across 2 Macs (launch with `mlx.launch`, needs `--seed`) |
 | `--output-path` | `output.mp4` | Output video path |
 
 ---
